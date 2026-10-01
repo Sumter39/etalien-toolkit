@@ -1,0 +1,10 @@
+# etalien-toolkit · Python 依赖
+#
+#   pip install -r requirements.txt
+#
+# 说明：
+#   uiautomator2  安卓端签到（模拟器 UI 自动化），会自带 adbutils
+#   pywin32       PC 端守护进程用（win32gui / win32con 接收系统关机、睡眠广播）
+#
+uiautomator2>=3.2.0
+pywin32>=306

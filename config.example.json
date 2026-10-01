@@ -1,0 +1,17 @@
+{
+  "_说明": "复制本文件为 config.json 再填写。config.json 已被 .gitignore 忽略，不会上传。",
+
+  "mumu_manager": "<MuMu 安装目录>\\nx_main\\MuMuManager.exe",
+  "adb_path": "<MuMu 安装目录>\\nx_main\\adb.exe",
+  "mumu_vmindex": "0",
+
+  "serial": "127.0.0.1:16384",
+  "adb_ports": ["127.0.0.1:16384", "127.0.0.1:7555"],
+
+  "oaid": "<任意 UUID，形如 00000000-0000-0000-0000-000000000000>",
+
+  "mumu_boot_timeout": 240,
+  "ad_stay": 15,
+  "ad_stay_jitter": 4,
+  "idle_minutes": 15
+}
