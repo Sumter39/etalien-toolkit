@@ -1,18 +1,17 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""统一配置加载 —— 把「跟这台机器绑定」的东西从代码里赶出去。
+"""统一配置加载。
 
-代码里只留应用自身的常量（包名、按钮文案、接口路径……），
-凡是会因人而异的（模拟器装在哪、adb 在哪、OAID 填什么）一律放
-项目根目录的 ``config.json``，该文件已被 ``.gitignore`` 忽略。
+代码里只留与应用自身相关的常量（包名、按钮文案、接口路径……）；
+凡是随机器变化的（模拟器路径、adb 路径、OAID、设备 ID 等）一律从项目根目录的
+``config.json`` 读取，该文件已被 ``.gitignore`` 忽略。
 
 首次使用：
 
     copy config.example.json config.json    # Windows
     cp    config.example.json config.json   # Git Bash
 
-然后按实际情况填写。缺失必填项时会直接报错并指明缺哪一项，
-不会静默用「某个默认值」跑出一个看起来正常、实际上错的结果。
+必填项缺失时抛 SystemExit，并指明缺哪一项、模板在哪。
 """
 
 import json
@@ -24,14 +23,11 @@ EXAMPLE_FILE = os.path.join(ROOT, "config.example.json")
 
 _cache = None
 
-# 缺省值：仅用于「不该逼用户配」的项；私有/环境相关的项一律不给默认值
+# 缺省值只有一个用途：纯调优参数，不该逼用户配。
+# **跟本机绑定的项（模拟器/adb 路径、实例编号、serial、OAID）一律不给默认值** ——
+# 写死一个值会在换机后出现「看着能跑、其实连错设备」的隐蔽故障，比直接报错危险得多。
 DEFAULTS = {
-    "mumu_vmindex": "0",
-    "serial": "127.0.0.1:16384",
-    "adb_ports": ["127.0.0.1:16384", "127.0.0.1:7555"],
     "mumu_boot_timeout": 240,
-    "ad_stay": 15,
-    "ad_stay_jitter": 4,
     "idle_minutes": 15,
 }
 

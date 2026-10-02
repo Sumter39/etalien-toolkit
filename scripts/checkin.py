@@ -2,64 +2,41 @@
 # -*- coding: utf-8 -*-
 """
 外星仔加速器 · 每日「看广告领时长」自动签到
-============================================
-实现方式：**纯 UI 自动化 + 停留计时**，不调用任何接口。
 
-核心原理（实测验证）
-------------------------
-外星仔的发奖判定不在广告页上，而在宿主 App 里：**只要广告 Activity 存活够
-时间，回到主界面就自动发奖**（+20 分钟 / +1 次）。
+点「看广告 领时长」→ 等广告 Activity 起来 → 停留 15 秒 → 回主界面。
+发奖由服务端按广告播放时长判定，所以不需要识别广告内容，也不点任何领奖按钮。
 
-因此整个流程不需要识别任何广告内容：
-
-    点「看广告 领时长」 → 等广告 Activity 起来 → 停 15 秒 → 拉回主界面 → 校验
-
-实测跨联盟通杀（三套完全不同的 UI，同一套逻辑全通过）：
-    快手   KSAdSDK   WMPortraitActivity
-    倍孜   BeiZi     BeiZiNewRewardVideoActivity
-    穿山甲 bytedance PortraitTransparentAdActivity
-
-为什么不用接口 / 不点领奖按钮
------------------------------
-1. 协议层已被官方封死：补发接口砍掉、token 换认证。
-2. 发奖由服务端按广告播放记录校验，客户端伪造无效。实测"不等够时间直接穿透"
-   会得到「广告加载失败」，进度不变 —— 时间没到就是不发。
-3. 反过来，"停够时间但不点任何按钮"照样发奖。所以点按钮是纯粹的额外风险。
-
-校验以后端数据为准（进度 N/9 或 可暂停时长），**不看 UI 提示** ——
-实测存在"提示失败但时长确实增加"的情况。
+判定**全部走接口，不读界面**（界面会滚动、会漏渲染，而"读不到"最容易被误当成
+"已完成"）：
+    单轮是否成功    /v2/account/pc/ad/config 的 watchCnt 增加（时长净增作旁证）
+    今日是否刷满    三档 watchCnt >= 该档条目数
+接口读不到时**不做任何推断**，直接停 —— 宁可少跑一轮，也不误判收工。
 
 环境前提
---------
-1. 已装 MuMu 模拟器，并把 `MuMuManager.exe` / `adb.exe` 的路径、
-   以及一个自定的 OAID 填进项目根目录的 `config.json`
-   （模板见 `config.example.json`）
-2. 模拟器里已装外星仔并登录
-3. 【关键】已用 KernelSU(ksud) 把机型属性改成 OnePlus 并写入 persist.oaid
-   —— 否则广告 SDK 报 "oaid sdk not find"，广告永远卡在"加载中"
-   （`ensure_ready()` 每次运行都会自动重刷，见下）
+    1. 已装 MuMu 模拟器；`config.json` 里填好 MuMuManager.exe / adb.exe 路径与
+       OAID（模板见 config.example.json）
+    2. 模拟器里已装外星仔并登录
+    3. 已用 KernelSU(ksud) 把机型属性改成 OnePlus 并写入 persist.oaid，
+       否则广告 SDK 报 "oaid sdk not find"，永远卡在「加载中」
+       （`ensure_ready()` 每次运行自动重刷）
 
 用法
-----
     python scripts/checkin.py                 # 跑满今天额度
     python scripts/checkin.py --rounds 3      # 只跑 3 轮
     python scripts/checkin.py --dry-run       # 只探测界面，不点击
-    python scripts/checkin.py --state         # 打印每日状态（看到哪、刷完没）
+    python scripts/checkin.py --state         # 打印每日状态
+    python scripts/checkin.py --install       # 装 / 卸开机自启（--uninstall 反操作）
 
-每日状态（output/state.json）
------------------------------
-额度 0 点整点重置，所以跨天判断很简单。真正要防的是**同一天内只刷了一半**：
-刷到第 12 轮时电脑被关机、脚本被打断、或广告临时无填充 —— 只按「今天跑过没有」
-去重的话，这一天剩下的额度就永远补不回来了。所以状态记两个维度：
+每日状态 output/state.json
+    date       最后一次跑是哪天     —— 不是今天就必跑
+    all_done   那天是否已全部看完   —— 是今天但没看完，继续补跑
+    attempts   当天已尝试次数       —— 上限 6 次，防反复启动模拟器
+    progress   上次进度快照         —— 排查用
 
-    date       最后一次跑是哪天        → 不是今天 → 必跑
-    all_done   那天是否已全部看完      → 是今天但没看完 → 登录后继续补跑
-    attempts   当天已尝试的次数        → 防止刷不满时反复启动模拟器
-    progress   上次进度快照（几时几分）→ 排查用
-
-因此自启触发多次是安全的：刷满了就跳过，没刷满就接着刷。
+自启触发多次是安全的：刷满了跳过，没刷满接着补。
 """
 import argparse
+import ctypes
 import json
 import os
 import random
@@ -69,8 +46,10 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import etapi as E
 import etconfig as CFG
 from probe import find_adb
+
 
 # ----------------------------------------------------------------------------
 # 配置
@@ -86,12 +65,6 @@ CONFIG = {
     "package": "com.etalien.booster",
     "main_activity": "com.etalien.booster/com.etalien.booster.ui.MainActivity",
 
-    # --- 环境相关（config.json）---
-    "serial": CFG.get("serial"),
-    "mumu_vmindex": CFG.get("mumu_vmindex"),
-    "mumu_boot_timeout": CFG.get("mumu_boot_timeout"),
-    "adb_ports": CFG.get("adb_ports"),
-
     "fake_brand": "OnePlus",          # OnePlus → 广告SDK走OPPO路径 → 直接读 persist.oaid
     "brand_props": [
         "ro.product.manufacturer", "ro.product.brand",
@@ -104,14 +77,15 @@ CONFIG = {
     "watch_button": ["看广告 领时长", "看广告领时长", "点击重试"],
 
     # 【核心参数】广告页停留秒数。实测 15s 即可发奖，故基准 15s + 0~4s 抖动。
-    "ad_stay": CFG.get("ad_stay"),
-    "ad_stay_jitter": CFG.get("ad_stay_jitter"),
+    # 这是广告端的行为，跟本机无关，所以写死在代码里而不是放 config.json。
+    "ad_stay": 15,
+    "ad_stay_jitter": 4,
 
     # 等广告 Activity 出现的最长秒数
     "ad_appear_timeout": 40,
 
-    # 今日额度用尽标志（三档全满后主按钮会变成这句）
-    "done_flags": ["今日广告已看完", "请明日再来", "今日次数已用完"],
+    # 模拟器开机 / adb 就绪的上限（调优参数，config.json 可覆盖）
+    "mumu_boot_timeout": CFG.get("mumu_boot_timeout"),
 
     # 弹窗关键词
     "popup": ["我知道了", "跳过", "关闭", "以后再说", "暂不更新"],
@@ -120,8 +94,9 @@ CONFIG = {
     "login_flags": ["注册登录", "请输入手机号", "登录后开启加速"],
 
     # 轮次控制
-    # 额度分三档：阶段一 9 次(20分) → 阶段二 3 次(30分) → 加油包(实测≥7次,10分)。
-    # 实测单日 19 轮刷满，这里给足上限，实际由"额度用尽"或"连续失败"提前终止。
+    # 额度分三档：阶段一 9 次×20分 → 阶段二 3 次×30分 → 加油包 9 次×10分，
+    # 单日 21 轮刷满 ≈ 6 小时可暂停时长。这里给足上限，实际由「接口显示刷满」
+    # 或「连续失败」提前终止。
     "max_rounds": 25,
     "round_gap": (6, 14),        # 轮次间随机间隔（模拟真人节奏）
     "retry_per_round": 2,        # 单轮内失败重试次数
@@ -173,10 +148,20 @@ def _mumu_manager():
     return CFG.require("mumu_manager", "MuMuManager.exe 的完整路径")
 
 
+def _serial():
+    """模拟器 adb 地址。必填，不给默认值 —— 每台机器都可能不一样。"""
+    return CFG.require("serial", "模拟器 adb 地址，如 127.0.0.1:16384")
+
+
+def _vmindex():
+    """MuMu 实例编号（多开器里的序号）。必填，不给默认值。"""
+    return CFG.require("mumu_vmindex", "MuMu 实例编号，多开器里能看到，通常填 0")
+
+
 def _mumu_info():
     """查询 MuMu 实例状态；失败返回 {}。"""
     try:
-        r = subprocess.run([_mumu_manager(), "info", "-v", CONFIG["mumu_vmindex"]],
+        r = subprocess.run([_mumu_manager(), "info", "-v", _vmindex()],
                            capture_output=True, timeout=30)
         return json.loads((r.stdout or b"").decode("utf-8", "ignore"))
     except Exception:
@@ -187,6 +172,104 @@ def emulator_started():
     return bool(_mumu_info().get("is_android_started"))
 
 
+# 这些 exe 不参与清理：
+#   MuMuManager / mumu-cli   当前正在执行的 CLI 工具，不能自杀
+#   crashpad_handler         崩溃处理器，名字太通用，别的应用也在用
+#   各种 Install / Uninstall 一次性安装卸载程序
+_MUMU_SKIP = {
+    "mumumanager.exe", "mumu-cli.exe", "crashpad_handler.exe",
+    "mumudeviceengineinstaller.exe", "mumunxupdater.exe", "uninstall.exe",
+}
+_MUMU_SKIP_HINTS = ("install", "uninstall", "setup")
+
+# 只有这几个退了，才算「模拟器真的关掉了」：主程序 + 实例（窗口 / 虚拟机）。
+_MUMU_CORE = {"mumunxmain.exe", "mumunxservice.exe", "mumuplayer.exe",
+              "mumunxdevice.exe", "mumunxheadless.exe"}
+
+
+def _mumu_proc_names():
+    """MuMu 运行时可能用到的所有进程名。
+
+    直接扫安装目录下的 exe 文件名，而不是硬编码一张进程表 —— 换 MuMu 版本、
+    换安装路径都不用改代码（旧版是 MuMuPlayer.exe，新版是 MuMuNxMain.exe）。
+    注意必须**递归**：实例进程藏在 nx_device/<版本>/shell/ 里
+    （MuMuNxDevice.exe / MuMuNxHeadless.exe / NemuShell.exe …），只扫顶层会漏。
+    """
+    base = os.path.dirname(os.path.dirname(_mumu_manager()))     # …\MuMuPlayer
+    names = set()
+    for top in ("nx_main", "nx_device"):
+        for root, _dirs, files in os.walk(os.path.join(base, top)):
+            for f in files:
+                low = f.lower()
+                if not low.endswith(".exe") or low in _MUMU_SKIP:
+                    continue
+                if any(h in low for h in _MUMU_SKIP_HINTS):
+                    continue
+                names.add(f)
+    return names
+
+
+def _mumu_procs():
+    """当前还在跑的 MuMu 进程名（排序；取不到进程表时返回 []）。"""
+    try:
+        out = subprocess.run(["tasklist", "/FO", "CSV", "/NH"],
+                             capture_output=True, timeout=30).stdout
+        running = {ln.split('","')[0].strip('"')
+                   for ln in out.decode("gbk", "ignore").splitlines() if ln.strip()}
+    except Exception:
+        return []
+    return sorted(_mumu_proc_names() & running)
+
+
+def _core_alive():
+    """模拟器核心进程（主程序 / 实例）是否还在跑。"""
+    return any(p.lower() in _MUMU_CORE for p in _mumu_procs())
+
+
+def main_app_ready():
+    """MuMu 主程序（多开器）和它的服务是否都已就绪。
+
+    不看 info 里的 is_main —— 实测它一直返回 false，主程序在不在跑都是 false，
+    根本没法用。直接认进程名。
+    """
+    ps = {p.lower() for p in _mumu_procs()}
+    return "mumunxmain.exe" in ps and "mumunxservice.exe" in ps
+
+
+def ensure_main_app(timeout=90):
+    """确保 MuMu 主程序在跑 —— 不在的话 `control launch` 必然失败。
+
+    实测：主程序缺失时 `MuMuManager control launch` 报
+    `-503 mainnx connect failed`，等多久都没用；而主程序**必须以管理员权限**
+    运行，普通权限起来后 IPC 建不起来，一样连不上。用 runas 拉起后 5 秒就绪，
+    实例 17 秒起好。（本机 UAC 关闭，这一步静默、不弹框。）
+    """
+    if main_app_ready():
+        return True
+
+    exe = os.path.join(os.path.dirname(_mumu_manager()), "MuMuNxMain.exe")
+    if not os.path.exists(exe):
+        log(f"  ! 找不到 MuMu 主程序 {exe}")
+        return False
+
+    log("MuMu 主程序未运行，正在拉起…")
+    try:
+        ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, None,
+                                            os.path.dirname(exe), 1)
+    except Exception as e:
+        log(f"  ! 拉起主程序失败: {e}")
+        return False
+
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        if main_app_ready():
+            log(f"MuMu 主程序已就绪（{time.time() - t0:.0f}s）")
+            return True
+        time.sleep(3)
+    log(f"⚠ MuMu 主程序 {timeout}s 内未就绪，模拟器可能起不来")
+    return False
+
+
 def start_emulator():
     """用 MuMu 官方 MuMuManager 拉起实例，并等 Android 启动完成。"""
     mgr = _mumu_manager()
@@ -194,8 +277,11 @@ def start_emulator():
         log(f"✗ 找不到 {mgr} —— 确认 config.json 里的 mumu_manager 填对了")
         sys.exit(1)
 
+    # 上次跑完把主程序关了的话，这里得先把它拉回来，否则 launch 一定失败
+    ensure_main_app()
+
     log("模拟器未启动，正在拉起…")
-    subprocess.run([mgr, "control", "-v", CONFIG["mumu_vmindex"], "launch"],
+    subprocess.run([mgr, "control", "-v", _vmindex(), "launch"],
                    capture_output=True, timeout=180)
     t0 = time.time()
     while time.time() - t0 < CONFIG["mumu_boot_timeout"]:
@@ -208,34 +294,122 @@ def start_emulator():
 
 
 def shutdown_emulator():
-    """刷完后关闭模拟器（用户明确要求）。"""
+    """刷完后**彻底**关掉 MuMu（用户明确要求：脚本退出即完全关闭）。
+
+    只调 `control shutdown` 关不干净 —— 那只关 Android 实例（窗口 + VM 进程），
+    MuMu 主程序（多开器 MuMuNxMain.exe）和它的服务还挂在后台/托盘里。所以：
+
+        1. control shutdown   优雅关实例（VM 正常落盘）
+        2. main close         请主程序自己退出
+        3. 提权 taskkill      赖着不走时强杀（/T 连子进程）
+        4. taskkill 兜底      清掉其余普通权限能清的残留
+
+    主程序关掉后下次得重新拉起 —— `start_emulator()` 里的 `ensure_main_app()`
+    会负责，两边是配套的。
+    """
     mgr = _mumu_manager()
     log("正在关闭模拟器…")
+
+    # 1) 优雅关实例（让 VM 正常落盘）
     try:
-        subprocess.run([mgr, "control", "-v", CONFIG["mumu_vmindex"], "shutdown"],
+        subprocess.run([mgr, "control", "-v", _vmindex(), "shutdown"],
                        capture_output=True, timeout=120)
-        time.sleep(5)
     except Exception as e:
         log(f"  ! shutdown 异常: {e}")
-    if emulator_started():
-        log("  ! 实例仍在运行")
+    time.sleep(4)
+
+    # 2) 请主程序自己退出
+    try:
+        subprocess.run([mgr, "main", "close"], capture_output=True, timeout=60)
+    except Exception as e:
+        log(f"  ! main close 异常: {e}")
+    time.sleep(5)
+
+    # 3) 主程序还赖着 → 提权强杀。/T 连 MuMuNxService 等子进程一起清；
+    #    主程序是管理员权限跑的，普通权限的 taskkill 对它只会 Access denied。
+    if _core_alive():
+        tk = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                          "System32", "taskkill.exe")
+        for img in ("MuMuNxMain.exe", "MuMuNxService.exe"):
+            try:
+                ctypes.windll.shell32.ShellExecuteW(None, "runas", tk,
+                                                    f"/F /T /IM {img}", None, 0)
+            except Exception:
+                pass
+        for _ in range(10):
+            time.sleep(2)
+            if not _core_alive():
+                break
+
+    # 4) 顺带清掉普通权限就能清掉的其余 MuMu 进程
+    for _ in range(4):
+        rest = [p for p in _mumu_procs() if p.lower() not in _MUMU_CORE]
+        if not rest:
+            break
+        killed = 0
+        for p in rest:
+            try:
+                r = subprocess.run(["taskkill", "/F", "/IM", p],
+                                   capture_output=True, timeout=30)
+                killed += (r.returncode == 0)
+            except Exception:
+                pass
+        if not killed:          # 全是「拒绝访问」，再试多少次都一样
+            break
+        time.sleep(2)
+
+    left = _mumu_procs()
+    core = [p for p in left if p.lower() in _MUMU_CORE]
+    if core:
+        log(f"  ⚠ 模拟器核心进程未退出：{', '.join(core)}")
     else:
-        log("  ✓ 模拟器已关闭")
+        log("  ✓ 模拟器已完全关闭")
+    rest = [p for p in left if p.lower() not in _MUMU_CORE]
+    if rest:
+        # MuMu 安装时注册的常驻组件（远程控制 / 健康上报 / adb），开机就在，
+        # 跑在更高权限的会话里，普通权限杀不掉 —— 跟「模拟器还在跑」是两回事。
+        log(f"    （以下常驻服务仍在，非本脚本启动：{', '.join(rest)}）")
 
 
-def mumu_sh(cmd, timeout=40):
-    """通过 MuMu 自带的 shell 通道执行命令。
+def adb_sh(adb, cmd, timeout=30):
+    """在模拟器里执行 shell 命令，返回 stdout 文本。
 
-    ⚠ 用这个**而不是** `adb root`：`adb root` 会重启 adbd，重启期间命令仍以
-    shell(uid=2000) 身份执行，访问 /data/adb/ksud 会 Permission denied，
-    冷启动时极难卡准时机。而 MuMuManager 的 sh 通道身份直接是 uid=0(root)。
+    走 adb 而不是 `MuMuManager.exe sh`：后者超时杀不掉子进程，会把调用它的
+    Python 一起拖死（实测卡住 10 分钟以上）。命令本身以什么身份执行由调用方
+    保证 —— 要写系统属性就先调 `ensure_root()`。
     """
     try:
-        r = subprocess.run([_mumu_manager(), "sh", "-v", CONFIG["mumu_vmindex"], "-c", cmd],
+        r = subprocess.run([adb, "-s", _serial(), "shell", cmd],
                            capture_output=True, timeout=timeout)
         return (r.stdout or b"").decode("utf-8", "ignore").strip()
     except Exception:
         return ""
+
+
+def ensure_root(adb):
+    """让 adb shell 拿到 root 身份 —— 注入 `ro.product.*` 需要它。
+
+    MuMu 的 adbd 支持 `adb root`（回 `restarting adbd as root`），重启后 `id`
+    就是 uid=0。**不要**改用 `MuMuManager.exe sh`：那条通道虽然天生是 root，
+    但请求超时杀不掉子进程，会把调用方一起拖死（实测卡 10 分钟以上）。
+
+    adbd 重启会断开连接，所以必须在「adb 已就绪」之后调。
+    """
+    if adb_sh(adb, "id").startswith("uid=0"):
+        return True
+    try:
+        subprocess.run([adb, "-s", _serial(), "root"],
+                       capture_output=True, timeout=30)
+        subprocess.run([adb, "-s", _serial(), "wait-for-device"],
+                       capture_output=True, timeout=60)
+    except Exception:
+        pass
+    for _ in range(8):
+        if adb_sh(adb, "id").startswith("uid=0"):
+            log("adb 已切到 root")
+            return True
+        time.sleep(3)
+    return False
 
 
 def ensure_ready(adb):
@@ -245,27 +419,31 @@ def ensure_ready(adb):
         sys.exit(1)
 
     # 2) 等 adb 可连
-    for _ in range(40):
-        for port in CONFIG["adb_ports"]:
-            subprocess.run([adb, "connect", port], capture_output=True, timeout=20)
+    log("等待模拟器 adb 就绪…")
+    t0 = time.time()
+    while time.time() - t0 < CONFIG["mumu_boot_timeout"]:
+        subprocess.run([adb, "connect", _serial()], capture_output=True, timeout=20)
         out = subprocess.run([adb, "devices"], capture_output=True, timeout=20).stdout.decode("utf-8", "ignore")
-        if CONFIG["serial"] in out:
+        if _serial() in out:
+            log(f"adb 已就绪（{time.time() - t0:.0f}s）")
             break
         time.sleep(5)
     else:
-        log("✗ 等不到模拟器 adb 就绪（120s）")
+        log(f"✗ 等不到模拟器 adb 就绪（{CONFIG['mumu_boot_timeout']}s）")
         sys.exit(1)
 
     # 3) 注入 OAID 与品牌属性（MuMu 每次重启都会还原 ro.*），带重试验证。
-    #    冷启动时系统可能还没就绪，mumu_sh 会返回空 → 靠重试兜住。
+    #    冷启动时系统可能还没就绪，命令会返回空 → 靠重试兜住。
+    if not ensure_root(adb):
+        log("⚠ 拿不到 adb root，品牌属性刷不进去 —— 广告多半无填充")
     oaid_value = CFG.require("oaid", "注入模拟器的假 OAID，任意 UUID 即可")
     brand = oaid = ""
     for i in range(8):
-        mumu_sh(f"setprop persist.oaid {oaid_value}")
+        adb_sh(adb, f"setprop persist.oaid {oaid_value}")
         for k in CONFIG["brand_props"]:
-            mumu_sh(f"/data/adb/ksud resetprop {k} {CONFIG['fake_brand']}")
-        brand = mumu_sh("getprop ro.product.manufacturer")
-        oaid = mumu_sh("getprop persist.oaid")
+            adb_sh(adb, f"/data/adb/ksud resetprop {k} {CONFIG['fake_brand']}")
+        brand = adb_sh(adb, "getprop ro.product.manufacturer")
+        oaid = adb_sh(adb, "getprop persist.oaid")
         if CONFIG["fake_brand"].lower() in brand.lower() and oaid_value in oaid:
             log(f"OAID 环境已就绪（brand={brand}, oaid={oaid[:8]}…）")
             return
@@ -287,7 +465,7 @@ def connect():
 
     import uiautomator2 as u2
     try:
-        d = u2.connect(CONFIG["serial"])
+        d = u2.connect(_serial())
     except Exception:
         d = u2.connect()
     info = d.info
@@ -295,59 +473,64 @@ def connect():
     log(f"已连接 {d.serial}  {w}x{h}")
     if w > h:
         log("⚠ 当前是横屏。App 为竖屏设计，建议固定为竖屏：")
-        log(f'  MuMuManager.exe setting -v {CONFIG["mumu_vmindex"]} -k resolution_mode -val phone.1')
-    return d
+        log(f'  MuMuManager.exe setting -v {_vmindex()} -k resolution_mode -val phone.1')
+    return d, adb
 
 
 # ----------------------------------------------------------------------------
-# 状态读取（以后端数据为准）
+# 进度读取（全部走接口，不读界面）
 # ----------------------------------------------------------------------------
-STAGES = ["阶段一", "阶段二", "加油包"]
+def read_progress(adb, serial, tries=2):
+    """读一次进度；失败会重读 App token 再试，仍失败返回最后一次的结果。
 
-
-def read_state(d):
-    """返回 (可暂停总秒数, 各档位状态 dict)，读不到的为 None。
-
-    界面把额度分成三档，满额后文案会从 "N / M" 变成「已完成」：
-        阶段一  9 次 × 20 分钟
-        阶段二  3 次 × 30 分钟
-        加油包  待解锁
-    所以进度用通用解析，且**核心判定一律以「时长是否增加」为准**，
-    不依赖任何具体文案格式。
+    每次都重新从模拟器取 token —— App 自己会调 refresh/token 续期，
+    现读的就是最新的一份。
     """
-    xml = d.dump_hierarchy()
-    vals = [v.strip() for v in re.findall(r'text="([^"]*)"', xml) if v.strip()]
-
-    seconds = None
-    for i, v in enumerate(vals):
-        if v == "时" and i >= 1 and i + 4 < len(vals) \
-                and vals[i + 2] == "分" and vals[i + 4] == "秒":
-            try:
-                seconds = int(vals[i - 1]) * 3600 + int(vals[i + 1]) * 60 + int(vals[i + 3])
-            except ValueError:
-                pass
-            break
-
-    stages = {}
-    for name in STAGES:
-        if name not in vals:
-            continue
-        i = vals.index(name)
-        for j in range(i + 1, min(i + 4, len(vals))):
-            if vals[j] in ("已完成", "待解锁") or re.fullmatch(r"\d+\s*/\s*\d+", vals[j]):
-                stages[name] = vals[j]
-                break
-    return seconds, stages
+    r = None
+    for i in range(tries):
+        r = E.read_progress(adb, serial)
+        if r["ok"]:
+            return r
+        log(f"  ! 接口读取失败：{r['reason']}")
+        if i + 1 < tries:
+            time.sleep(4)
+    return r
 
 
-def fmt_state(state):
-    seconds, stages = state
-    if seconds is None:
-        bal = "?"
-    else:
-        bal = f"{seconds // 3600}时{seconds % 3600 // 60}分{seconds % 60}秒"
-    detail = "  ".join(f"{k} {v}" for k, v in stages.items() if k in ("阶段一", "阶段二"))
-    return f"时长 {bal}" + (f"  [{detail}]" if detail else "")
+def fmt_progress(p):
+    """打一行，例如：时长 6时8分  [阶段一 9/9  阶段二 0/3  加油包 0/9]"""
+    sec = p.get("seconds")
+    bal = E.fmt_dur(sec) if sec is not None else "?"
+    parts = [f"{s['title']} {s['done']}/{s['total']}" for s in (p.get("stages") or [])]
+    return "时长 " + bal + ("  [" + "  ".join(parts) + "]" if parts else "")
+
+
+def progressed(before, after):
+    """本轮是否真的进账；返回描述字符串，没进账返回 None。
+
+    主判据是 watchCnt 增加 —— 它是纯计数，不像可暂停时长那样会被加速扣减
+    稀释掉。时长净增只当旁证。
+    """
+    old = {s["title"]: s for s in (before.get("stages") or [])}
+    for s in (after.get("stages") or []):
+        o = old.get(s["title"])
+        if o and s["done"] > o["done"]:
+            return f"{s['title']} {o['done']}→{s['done']}/{s['total']}"
+    bs, as_ = before.get("seconds"), after.get("seconds")
+    if bs is not None and as_ is not None and as_ > bs:
+        return f"时长 +{int((as_ - bs) // 60)} 分钟"
+    return None
+
+
+def quota_done(stages):
+    """三档是否都刷满。
+
+    读不到档位（接口没回、返回空）一律**不算刷满** ——「看不到」不等于
+    「已完成」，以前的误判就是在这栽的。
+    """
+    if not stages:
+        return False
+    return all(s["total"] > 0 and s["done"] >= s["total"] for s in stages)
 
 
 # ----------------------------------------------------------------------------
@@ -462,57 +645,6 @@ def is_logged_in(d):
     return True
 
 
-def is_exhausted(d):
-    """今日额度是否已全部刷完（三档满额后主按钮变成「今日广告已看完」）。"""
-    for t in CONFIG["done_flags"]:
-        try:
-            if d(textContains=t).exists:
-                return True
-        except Exception:
-            pass
-    return False
-
-
-def _stage_done(v):
-    """单档是否已完成：文案「已完成」，或进度形如 9/9。"""
-    if not v:
-        return False
-    if v == "已完成":
-        return True
-    m = re.fullmatch(r"(\d+)\s*/\s*(\d+)", v)
-    return bool(m and m.group(1) == m.group(2))
-
-
-def stages_all_done(stages):
-    """按三档进度数据判断是否刷满 —— 不依赖那句「今日广告已看完」的文案。
-
-    够不着的一档（界面没渲染到）不下结论；「待解锁」的加油包不算未完成。
-    """
-    if not stages:
-        return False
-    saw = False
-    for name in STAGES:
-        v = stages.get(name)
-        if v is None or v == "待解锁":
-            continue
-        saw = True
-        if not _stage_done(v):
-            return False
-    return saw
-
-
-def quota_done(d, stages=None):
-    """额度是否刷满：UI 提示 或 三档进度数据，任一成立即算。"""
-    if is_exhausted(d):
-        return True
-    if stages is None:
-        try:
-            _, stages = read_state(d)
-        except Exception:
-            return False
-    return stages_all_done(stages)
-
-
 # ----------------------------------------------------------------------------
 # 每日状态（记住 last run day + 是否「全部看完」）
 # ----------------------------------------------------------------------------
@@ -530,8 +662,6 @@ def load_state():
         return {}
     if not raw:
         return {}
-    if not raw.startswith("{"):                 # 旧格式：只有一个日期字符串
-        return {"date": raw, "all_done": True, "attempts": 1}
     try:
         st = json.loads(raw)
         return st if isinstance(st, dict) else {}
@@ -582,22 +712,26 @@ def bump_attempt():
 # ----------------------------------------------------------------------------
 # 单轮流程
 # ----------------------------------------------------------------------------
-def run_one_round(d):
-    """返回 (状态, 快照)。状态：'ok' 成功 / 'done' 今日额度用尽 / 'fail' 失败。"""
+def run_one_round(d, adb, serial):
+    """返回 (状态, 快照)。状态：'ok' 成功 / 'done' 已刷满 / 'fail' 失败 / 'error' 接口不通。"""
     dismiss_popups(d)
-    if not ensure_on_ads_page(d):
-        if quota_done(d):
-            return "done", None
-        log("  ✗ 不在「看广告」页面")
-        return "fail", None
 
-    before = read_state(d)
+    # 先读进度再点 —— 接口不通就别点，点了也不知道成没成，白扣广告额度
+    before = read_progress(adb, serial)
+    if not before["ok"]:
+        return "error", before
+
+    if not ensure_on_ads_page(d):
+        if quota_done(before["stages"]):
+            return "done", before
+        log("  ✗ 不在「看广告」页面")
+        return "fail", before
 
     # 1) 点「看广告 领时长」
     el, label = find_any(d, CONFIG["watch_button"], timeout=5)
     if not el:
         log("  ✗ 找不到「看广告」按钮")
-        return "done" if quota_done(d, before[1]) else "fail", before
+        return ("done" if quota_done(before["stages"]) else "fail"), before
     try:
         el.click()
     except Exception as e:
@@ -612,7 +746,7 @@ def run_one_round(d):
             break
         time.sleep(1)
     else:
-        if quota_done(d, before[1]):
+        if quota_done(before["stages"]):
             return "done", before
         log("  ✗ 广告未出现（无填充 or 额度已用尽）")
         return "fail", before
@@ -643,17 +777,19 @@ def run_one_round(d):
     time.sleep(2)
     dismiss_popups(d)
 
-    # 5) 校验（以后端数据为准，不看 UI 提示）
-    #    实测存在"提示领取失败、但时长确实增加"的情况，所以一律以时长增量为准。
-    after = read_state(d)
-    bsec, _ = before
-    asec, _ = after
-    if bsec is not None and asec is not None and asec > bsec:
-        log(f"  ✓ 成功  时长 +{(asec - bsec) // 60:.0f} 分钟   （{fmt_state(after)}）")
+    # 5) 校验：全看接口。界面提示不算数（实测有「提示失败、时长确实增加」，
+    #    也有「文案说看完了、其实还差几次」）。
+    after = read_progress(adb, serial)
+    if not after["ok"]:
+        log(f"  ✗ 读不到进度，本轮结果未知：{after['reason']}")
+        return "error", before
+    got = progressed(before, after)
+    if got:
+        log(f"  ✓ 成功  {got}   （{fmt_progress(after)}）")
         return "ok", after
-    if quota_done(d, after[1]):
+    if quota_done(after["stages"]):
         return "done", after
-    log(f"  ✗ 未生效  {fmt_state(before)} → {fmt_state(after)}")
+    log(f"  ✗ 未生效  {fmt_progress(before)} → {fmt_progress(after)}")
     return "fail", after
 
 
@@ -679,12 +815,33 @@ def dump_ui(d):
 
 RUN_KEY = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
 RUN_NAME = "EtalienDailyCheckin"
-LEGACY_STARTUP_CMD = "etalien_daily_checkin.cmd"
 
 
-def _startup_dir():
-    return os.path.join(os.environ.get("APPDATA", ""),
-                        "Microsoft", "Windows", "Start Menu", "Programs", "Startup")
+def cmd_renew_token():
+    """只把凭据续一份新的：启模拟器 → 读 App 的 token 存进 cred.json → 关模拟器。
+
+    给 watchdog 当**退路**用 —— 它那边补凭据是先 `etapi.py scan`（提权重抓 PC
+    客户端，不启模拟器、约 1 秒），走不通才调这里。因为 PC 端凭据过期后没法
+    自愈（客户端自己也不刷新），能续期的只有 App（它带 refresh/token 逻辑）。
+
+    这里只借 App 的手刷新凭据，不刷广告、不动每日状态，所以不受 attempts 上限影响。
+    """
+    adb = find_adb()
+    try:
+        ensure_ready(adb)
+    except SystemExit as e:
+        log(f"✗ 续期失败：{e}")
+        return 1
+    r = read_progress(adb, _serial(), tries=1)
+    try:
+        shutdown_emulator()
+    except Exception:
+        pass
+    if r["ok"]:
+        log(f"✓ 凭据已续到最新：{fmt_progress(r)}")
+        return 0
+    log(f"✗ 续期失败：{r['reason']}")
+    return 1
 
 
 def cmd_install():
@@ -698,16 +855,13 @@ def cmd_install():
     pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
     if not os.path.exists(pyw):
         pyw = sys.executable
-    cmdline = '"%s" "%s" --delay 120' % (pyw, os.path.abspath(__file__))
+    # 登录后等 30s 再开跑：够 explorer 把自启项都拉起来、网络/磁盘稳定下来，
+    # 又不至于把整个流程拖太久。
+    cmdline = '"%s" "%s" --delay 30' % (pyw, os.path.abspath(__file__))
 
     key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE)
     winreg.SetValueEx(key, RUN_NAME, 0, winreg.REG_SZ, cmdline)
     winreg.CloseKey(key)
-
-    stale = os.path.join(_startup_dir(), LEGACY_STARTUP_CMD)
-    if os.path.exists(stale):
-        os.remove(stale)
-        print("已清理旧启动项:", stale)
 
     print("已安装开机自启（注册表 Run 项）：")
     print("  HKCU\\%s\\%s" % (RUN_KEY, RUN_NAME))
@@ -727,11 +881,6 @@ def cmd_uninstall():
     except Exception as e:
         print("移除失败:", e)
 
-    stale = os.path.join(_startup_dir(), LEGACY_STARTUP_CMD)
-    if os.path.exists(stale):
-        os.remove(stale)
-        print("已清理启动文件夹:", stale)
-
 
 def main():
     ap = argparse.ArgumentParser()
@@ -744,8 +893,12 @@ def main():
     ap.add_argument("--state", action="store_true", help="打印每日状态后退出（不连模拟器）")
     ap.add_argument("--install", action="store_true", help="安装开机自启（注册表 Run 项）")
     ap.add_argument("--uninstall", action="store_true", help="移除开机自启")
+    ap.add_argument("--renew-token", action="store_true",
+                    help="只续凭据（启模拟器读 App token），不刷广告 —— 供 watchdog 调用")
     args = ap.parse_args()
 
+    if args.renew_token:
+        return cmd_renew_token()
     if args.install:
         return cmd_install()
     if args.uninstall:
@@ -780,7 +933,7 @@ def main():
         log(f"等待 {args.delay} 秒后开始（让系统先稳定下来）…")
         time.sleep(args.delay)
 
-    d = connect()
+    d, adb = connect()
 
     if args.dry_run:
         dump_ui(d)
@@ -794,51 +947,62 @@ def main():
     all_done = False       # 今天额度是否已全部看完 → 决定以后还要不要补跑
     progress = None        # 进度快照，便于知道上次停在哪
     started = False        # 是否「有效尝试」：决定要不要把今天记进状态
-    shutdown = False       # 是否关模拟器（登录/排查场景留着不关）
+    # 退出即彻底关掉模拟器（用户明确要求）。要留着现场排查/手动登录，
+    # 加 --keep-emulator。
+    shutdown = True
     try:
-        if not is_logged_in(d):
-            log("✗ 未登录，请先手动完成登录。本轮不关模拟器、不写状态。")
+        # 登录状态以接口为准（能读到进度就是已登录）。界面文案只用来补充提示 ——
+        # UI 会漏渲染、也会出现同名字样，拿它当判定条件会误退。
+        cur = read_progress(adb, _serial())
+        if not cur["ok"]:
+            hint = "界面显示需要登录，请手动登录一次。" if not is_logged_in(d) else ""
+            log(f"✗ 接口读不到进度（{cur['reason']}）{hint}本轮不写状态。"
+                "（想留着模拟器排查，加 --keep-emulator）")
+            return
+
+        if quota_done(cur["stages"]):
+            log(f"启动时接口已显示三档刷满：{fmt_progress(cur)}")
+            started = True
+            all_done = True
+            progress = fmt_progress(cur)      # 让 --state 能看到停在哪
             return
 
         if not ensure_on_ads_page(d):
-            if quota_done(d):
-                log("启动时额度就已经是「全部看完」状态")
-                shutdown = started = True
-                # 只有非凌晨时段才敢认。凌晨 0-6 点看到「已完成」，可能是前一天
-                # 的额度还没重置（界面没刷新），若就此收工，整个白天都不会再试，
-                # 白丢一天额度。记成「没看完」→ 白天登录时自然补跑。
-                if time.localtime().tm_hour >= 6:
-                    all_done = True
-                else:
-                    log("（凌晨时段，可能是昨日额度未刷新 —— 本次记为「未看完」，白天会再补跑一趟）")
-                return
-            log("✗ 未找到「看广告 领时长」入口，dump 当前界面。本轮不关模拟器，不写状态。")
+            log("✗ 未找到「看广告 领时长」入口，dump 当前界面。本轮不写状态。")
             dump_ui(d)
             return
 
         started = True
         bump_attempt()     # 立即落盘：中途被关机也算一次尝试，不会被无限重试
-        log(f"起始：{fmt_state(read_state(d))}")
+        log(f"起始：{fmt_progress(cur)}")
 
-        ok = fail = 0
+        ok = fail = error = 0
         for i in range(1, args.rounds + 1):
             log(f"--- 第 {i} 轮 ---")
-            status = "fail"
+            status, snap = "fail", cur
             for attempt in range(1 + CONFIG["retry_per_round"]):
                 if attempt:
                     log(f"  重试 #{attempt}")
                     punch_home(d)
                     time.sleep(3)
-                status, snap = run_one_round(d)
+                status, snap = run_one_round(d, adb, _serial())
                 if status != "fail":
                     break
             if status == "ok":
                 ok += 1
-                fail = 0
+                fail = error = 0
             elif status == "done":
-                log("今日广告已全部看完，收工")
+                log(f"接口显示三档已全部看完，收工（{fmt_progress(snap)}）")
                 all_done = True
                 break
+            elif status == "error":
+                # 接口不通时**不推断结果**：既不算成功也不算失败，重试几次还不行就收工
+                error += 1
+                if error >= 2:
+                    log("接口一直读不到进度，停止（不猜、不误判；已完成的额度不会丢）")
+                    break
+                time.sleep(5)
+                continue
             else:
                 fail += 1
                 if fail >= CONFIG["max_consecutive_fail"]:
@@ -846,7 +1010,7 @@ def main():
                     break
 
             # 每轮都刷一次进度快照：万一接下来被关机，也能看出停在哪
-            progress = fmt_state(snap) if snap else fmt_state(read_state(d))
+            progress = fmt_progress(snap)
             save_state(date=today, progress=progress)
 
             if i < args.rounds:
@@ -854,14 +1018,12 @@ def main():
                 log(f"  间隔 {gap:.0f}s（模拟真人节奏）")
                 time.sleep(gap)
 
-        final = read_state(d)
-        progress = fmt_state(final)
-        # 轮次跑满/提前停都再确认一遍额度：UI 提示 或 三档进度数据
-        if not all_done:
-            all_done = quota_done(d, final[1])
+        final = read_progress(adb, _serial())
+        progress = fmt_progress(final)
+        if not all_done and final["ok"]:
+            all_done = quota_done(final["stages"])
         log(f"===== 结束：成功 {ok} 轮，失败 {fail} 轮，{progress}，"
             f"{'已全部看完' if all_done else '未看完'} =====")
-        shutdown = True
     finally:
         if started:
             save_state(date=today, all_done=all_done, progress=progress)

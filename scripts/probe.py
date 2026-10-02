@@ -1,61 +1,27 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""
-外星仔加速器 · 环境自检与界面探测
-=====================================
-换机器 / 换模拟器版本 / 界面改版后，先跑这个脚本摸一遍环境。
+"""外星仔加速器 · 环境自检与界面探测。
 
-它会输出并保存到 output/：
-  1. 可用的 adb 路径
-  2. 已连接的设备列表
-  3. 外星仔加速器的包名
-  4. 当前界面的层级结构（uiautomator dump）
-  5. 当前界面截图
+换机器、换模拟器版本或界面改版后先跑一次，输出并保存到 output/：
+
+    1. 可用的 adb 路径
+    2. 已连接的设备列表
+    3. 外星仔包名
+    4. 当前界面层级（uiautomator dump）
+    5. 当前界面截图
 
 用法：
-  python scripts/probe.py
+    python scripts/probe.py
 """
 import os
-import re
-import shutil
 import subprocess
 import sys
-import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import etconfig as CFG
 
 ROOT = CFG.ROOT
 OUT = os.path.join(ROOT, "output")
-
-# 常见模拟器自带的 adb 位置（兜底用；config.json 里的 adb_path 优先）
-ADB_CANDIDATES = [
-    r"E:\MuMu\shell\adb.exe",
-    r"D:\MuMu\shell\adb.exe",
-    r"C:\MuMu\shell\adb.exe",
-    r"E:\MuMuPlayer\shell\adb.exe",
-    r"D:\MuMuPlayer\shell\adb.exe",
-    r"C:\Program Files\Netease\MuMuPlayer\shell\adb.exe",
-    r"C:\Program Files\Netease\MuMu Player 5\shell\adb.exe",
-    r"C:\Program Files\Netease\MuMuPlayer-5.0\shell\adb.exe",
-    # MuMu 12 旧版目录
-    r"C:\Program Files\Netease\MuMu Player 12\shell\adb.exe",
-    r"C:\Program Files\Netease\MuMuPlayer-12.0\shell\adb.exe",
-    r"C:\Program Files (x86)\Netease\MuMu Player 12\shell\adb.exe",
-    r"D:\Program Files\Netease\MuMu Player 12\shell\adb.exe",
-    r"D:\Program Files\Netease\MuMuPlayer-12.0\shell\adb.exe",
-    r"C:\MuMu\emulator\nemu\vmonitor\bin\adb_server.exe",
-    # 备选模拟器
-    r"C:\Program Files\Nox\bin\adb.exe",
-    r"C:\Nox\bin\adb.exe",
-    r"D:\Nox\bin\adb.exe",
-    r"C:\LDPlayer\LDPlayer9\adb.exe",
-    r"C:\LDPlayer\LDPlayer64\adb.exe",
-    r"D:\LDPlayer\LDPlayer9\adb.exe",
-    r"D:\LDPlayer9\adb.exe",
-    r"C:\Program Files\ldplayer\LDPlayer9\adb.exe",
-    r"C:\Program Files\BlueStacks_nxt\HD-Adb.exe",
-]
 
 KEYWORDS = ("外星", "alien", "et001", "acceler", "star", "xingyu", "jiasu")
 
@@ -65,25 +31,14 @@ def log(msg):
 
 
 def find_adb():
-    """定位 adb.exe：config.json 指定 > PATH > 模拟器常见目录 > 兜底扫描。"""
-    cfg = CFG.get("adb_path")
-    if cfg and os.path.isfile(cfg):
-        return cfg
-    p = shutil.which("adb")
-    if p:
-        return p
-    for c in ADB_CANDIDATES:
-        if os.path.isfile(c):
-            return c
-    # 兜底：扫一层盘符下的常见目录
-    import glob
-    for drive in ("C:", "D:", "E:"):
-        for pat in (r"\*\*\shell\adb.exe", r"\*\adb.exe", r"\*\*\adb.exe",
-                    r"\*\*\*\adb.exe"):
-            hits = glob.glob(drive + pat)
-            if hits:
-                return hits[0]
-    return None
+    """adb.exe 的路径 —— 只认 config.json 里的 adb_path。
+
+    刻意不内置「常见安装目录」清单，也不扫盘：猜中一个别的模拟器自带 adb，
+    会连到错的设备上，而且出错点被推到后面某一步，很难查。
+    缺了就直接报「填 adb_path」，模板在 config.example.json。
+    """
+    return CFG.require(
+        "adb_path", r"adb.exe 的完整路径，通常在 <MuMu 安装目录>\nx_main\adb.exe")
 
 
 def run(cmd, timeout=30):
@@ -102,12 +57,6 @@ def main():
 
     # ---- 1. adb ----
     adb = find_adb()
-    if not adb:
-        log("[X] 没找到 adb.exe")
-        log("    → 确认模拟器已安装。MuMu 12 的 adb 通常在:")
-        log("      <安装目录>\\shell\\adb.exe")
-        log("    → 若仍找不到，把模拟器安装目录告诉我。")
-        return 1
     log(f"[OK] adb: {adb}")
     report.append(f"adb: {adb}")
 
