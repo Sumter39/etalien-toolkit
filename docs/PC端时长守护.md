@@ -5,31 +5,25 @@
 
 ---
 
-## 一、为什么需要外部干预
+## 一、计时规则
 
-### 关掉客户端不会停止计时
+计时在服务端跑，与本地进程无关：
 
 ```
 12:42:10  加速中，客户端在跑
           ↓ 60 秒  →  扣 62 秒
 12:43:13  taskkill /F 强杀 etalien.exe
-          ↓ 150 秒 →  扣 154 秒   ← 客户端已经死透，照扣
+          ↓ 150 秒 →  扣 154 秒   ← 客户端已经退出，照扣
 ```
 
-扣费在服务端跑，与本地进程无关。
-
-### 免费账号没有自动暂停
-
-官方 wiki 原话：「时长需要手动暂停，退出加速器前请务必【手动暂停计时】」。
-
-代码里跟 VIP 绑死的那套（`pcVipState` / `vip_time_pause` /「时长保护」）才是自动的，
-免费账号走的是手动路径。
+免费账号的时长需要手动暂停（官方 wiki：「退出加速器前请务必【手动暂停计时】」）；
+自动暂停那套（`pcVipState` / `vip_time_pause` /「时长保护」）与 VIP 绑定。
 
 ---
 
 ## 二、接口是怎么挖出来的
 
-没装代理，也没改系统。token 明文躺在客户端进程内存里，直接读。
+token 明文躺在客户端进程内存里，直接读。
 
 | 步骤 | 做法 | 收获 |
 |---|---|---|
@@ -39,9 +33,9 @@
 挖到的东西：
 
 ```
-鉴权：authorization: <裸 token>          ← 不是 JWT，就是一段字符串
-描述：x-eta: os=2&ver=1.24.11&dvc=<设备ID>&ch=default   ← 静态串，不是动态签名
-协议：HTTPS + protobuf（不是 JSON），全部 POST
+鉴权：authorization: <裸 token>          ← 直接是一段字符串
+描述：x-eta: os=2&ver=1.24.11&dvc=<设备ID>&ch=default   ← 静态串
+协议：HTTPS + protobuf，全部 POST
 签名：sig 参数非强制，不带照样 200
 ```
 
@@ -80,8 +74,8 @@ field3 = 原因文本        field4 = 服务器时间戳
 | `field1=0` | HTTP 200，加速中 |
 | 重复传当前值 | HTTP 500 `can not update same pause state` |
 
-那个 500 不是错误，反而可以用来探测当前状态。重复调用是无害的，
-所以守护进程不必先查状态，直接发就行。
+返回 500 代表状态没变，可以直接用它探测当前状态。重复调用是无害的，
+所以守护进程直接发就行，不必先查状态。
 
 实测：
 
@@ -114,11 +108,11 @@ message-only 窗口收不到。窗口保持隐藏，不进任务栏、不进 Alt
 
 ---
 
-## 五、两个防误伤设计
+## 五、两条保守的判定规则
 
-1. **全屏应用豁免**：前台有铺满整屏的窗口时不判空闲。用手柄打游戏不产生键鼠输入，
-   光看空闲秒数会误杀。最大化的普通窗口高度会矮一截（让出任务栏），不会被误判。
-2. **保守的进程检测**：查询失败时按「客户端还在运行」处理，宁可漏触发，不可误触发。
+1. **全屏应用豁免**：前台有铺满整屏的窗口时不判空闲（手柄打游戏不产生键鼠输入，只看
+   空闲秒数不准）。最大化的普通窗口高度会矮一截（让出任务栏），不受影响。
+2. **进程检测**：查询失败时按「客户端还在运行」处理。
 
 ---
 
@@ -138,21 +132,33 @@ $PY scripts/watchdog.py --stop         # 停掉守护
 $PY scripts/watchdog.py --idle-min 30  # 改空闲阈值（默认 15 分钟）
 $PY scripts/watchdog.py --uninstall    # 移除自启
 
-$PY scripts/etapi.py duration          # 查剩余时长（不用开客户端、不用开模拟器）
+$PY scripts/etapi.py duration          # 查剩余时长（直接用 cred.json 里的 token 查）
 ```
 
-### token 失效了怎么办
+### 凭据失效时怎么补
+
+两条路，**先试第一条**（`watchdog` 自动补凭据时也是这个顺序）：
+
+**① 提权重抓 PC 客户端的 token**（约 1 秒）：
 
 ```bash
 $PY scripts/etapi.py scan
 ```
 
-一条命令，不需要手动开管理员 CMD。它会：
+一条命令搞定，提权自动完成。它会：
 
 1. 发现自己不是管理员，自动提权重新拉起自己
-2. 提权子进程读 `etalien.exe` 内存，用正则捞 `Authorization:` 头
+2. 提权子进程读 `etalien.exe` 内存，用**大小写不敏感**的正则捞 `authorization:` 头
 3. 结果写临时文件回传给父进程，由父进程落盘
 4. 顺手校验一次接口，并对比新旧 token 是否变化
+
+**② 第 ① 条走不通时**（客户端没开，或内存里没有现成的 token），
+启模拟器借 App 的手续一份 —— App 带 `refresh/token` 逻辑，脚本跑完顺手把新 token
+存进 `output/cred.json`：
+
+```bash
+$PY scripts/checkin.py --renew-token
+```
 
 实测输出：
 
@@ -166,11 +172,12 @@ ver   : 1.24.11
 校验  : HTTP 200 OK（剩余时长已取到）
 ```
 
-前置条件是客户端在跑且已登录；没跑会直接提示。
+前置条件是客户端在跑**且登录态还在**；没跑会直接提示。客户端的续期能力见第八节 ——
+它换不出新 token，只能重新登录，所以这条路走不通时转到第 ② 步。
 
-> 实现要点：普通进程 `OpenProcess` 会被内核直接拒绝（客户端是 `requireAdministrator`），
-> 提权走 `ShellExecuteW(None,"runas",...)`；子进程用 `pythonw.exe` 拉起，不闪黑框，
-> 因此子进程里不能 print，只能写文件。
+> 实现要点：客户端是 `requireAdministrator`，读它的内存要先提权
+> （`ShellExecuteW(None,"runas",...)`）；子进程用 `pythonw.exe` 拉起，不闪黑框，
+> 子进程没有 stdout，所以抓取逻辑一律写文件。
 
 ### 自启项
 
@@ -182,30 +189,31 @@ HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Run\EtalienTimeGuard
 
 ### 凭据
 
-`output/token.txt`、`output/device.txt`、`config.json` 三者都在 `.gitignore` 里，
-仓库不含任何真实凭据，代码里也没有兜底默认值。守护进程启动时自检一次，失效会写进日志。
+`output/cred.json`（token + 来源端 os/ver）、`output/device.txt` 与 `config.json`
+都在 `.gitignore` 里，仓库不含任何真实凭据，因机器而异的值一律从 `config.json` 现读。
+守护进程启动时自检一次，之后每 30 分钟复检，状态变化才写日志。
 
 ---
 
-## 七、踩坑
+## 七、实现要点
 
-| 坑 | 处理 |
+| 事项 | 做法 |
 |---|---|
-| 普通权限 `OpenProcess` 返回 0，`err=5` | 客户端是 `requireAdministrator`。`etapi.py scan` 会自动提权重抓 |
-| 提权子进程 print 报错 | 子进程用 `pythonw.exe` 拉起，没有 stdout。抓取逻辑一律不 print，只写文件 |
-| `ShellExecuteW runas` 的引号地狱 | 直接传 `"<脚本路径>" scan --elevated --result "<结果路径>"`，别用 `-c` 塞代码 |
-| `field1` 语义搞反 | `1` 是暂停、`0` 是加速，别按开关的直觉写 |
-| 重复上报返回 500 | 正常，代表状态没变，可放心幂等调用 |
-| `WM_POWERBROADCAST` 收不到 | 必须是真顶层窗口，message-only 窗口不接收广播 |
-| Flutter 界面抓不到控件 | `PrintWindow` 对 GPU 渲染无效，截图要用 `ImageGrab` + 窗口置顶 |
-| 启动文件夹的 `.cmd` 静默失效 | 路径被写成正斜杠，`start` 不认。改用注册表 Run 键 |
-| 内存里的中文串挖不出来 | Dart AOT 做了处理，只能从英文侧（类名、路径）找线索 |
+| 读客户端内存要提权 | 客户端是 `requireAdministrator`。`etapi.py scan` 自动提权重抓 |
+| 提权子进程没有 stdout | 子进程用 `pythonw.exe` 拉起。抓取逻辑一律写文件，不 print |
+| `ShellExecuteW runas` 的参数传递 | 直接把脚本路径和参数当成命令行串传进去：`"<脚本路径>" scan --elevated --result "<结果路径>"` |
+| `field1` 的取值 | `1` 是暂停、`0` 是加速（它是状态，不是开关） |
+| 重复上报返回 500 | 代表状态没变，幂等调用即可 |
+| `WM_POWERBROADCAST` 的接收条件 | 必须是真顶层窗口，message-only 窗口收不到广播 |
+| Flutter 界面抓控件 | `PrintWindow` 对 GPU 渲染无效，截图用 `ImageGrab` + 窗口置顶 |
+| 自启位置 | 注册表 Run 键：`pythonw.exe` + 脚本路径，登录即触发 |
+| 内存里的中文串 | Dart AOT 做了处理，从英文侧（类名、路径）找线索 |
 
 ---
 
-## 八、token 会过期吗
+## 八、token 的生命周期
 
-**会，但过期时刻只有服务端知道，客户端自己也不知道。**
+**token 会过期，过期时刻由服务端掌握。**
 
 ### 证据链
 
@@ -215,50 +223,84 @@ HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Run\EtalienTimeGuard
 | 2 | 篡改任意一位 → `401 cipher: message authentication failed` | 带 MAC 的自包含凭据（AES-GCM 一类），不是随机 session id |
 | 3 | 格式错 → `401 invalid auth token` | 服务端先解密再校验，两类失败分得清 |
 | 4 | app.so 里有 `get:tokenExpired` getter | 客户端确实有「过期」这个状态位 |
-| 5 | 路由表里没有任何 refresh / renew 接口 | 只有 `/v2/account/login`，过期后不能静默续期 |
+| 5 | 有 `/v2/account/refresh/token`，但要 `sig` 签名 | 缺签名回 `403 invalid sign, check the "sig" parameter`；算法在客户端里 ⇒ 续期由客户端和 App 完成，脚本只做搬运 |
 | 6 | 提权读内存，全局搜 `expireTime` / `expiresDate` / `tokenExpired` | 命中的全是 Dart 类名字符串池、证书 Pin Rules、WebView Cookie，没有任何一处存着过期时间 |
-| 7 | 内存里 token 明文只出现在 3 个地方 | 全是 HTTP/2 请求头缓存（`Authorization: <token>`），旁边没有时间字段 |
+| 7 | 内存里 token 明文只出现在请求头缓存里 | 全是 HTTP 请求头缓存，旁边没有时间字段。实测同一时刻 5 处：`authorization:` 2 处 + `Authorization:` 3 处 —— 大小写两种都有，所以搜它必须 `re.I` |
 | 8 | 本地 Hive 库（`user_login_info.hive`）是 `HiveAesCipher` 加密 | 密钥运行时才取（`fetchEncryptKey`），本地读不出 |
 
-第 4、6 条合起来是关键：客户端手里只有「过期了没有」这个布尔值，没有「什么时候过期」。
-它是被动的，撞上 401 才知道。这个信息在客户端侧根本不存在。
+第 4、6 条合起来说明：客户端手里只有「过期了没有」这个布尔值，没有「什么时候过期」——
+撞上 401 才知道，所以续期必须由客户端发起。
 
 ### 实测存活时长
 
 ```
-登录态落盘（user_login_info.hive 写入）
+10-01 01:24:35   签发
    │
-   ├─ 11 小时 23 分后   客户端重启，该文件未被改写 ⇒ 复用了同一个 token
+   ├─ 跨过一次客户端重启，token 没换 ⇒ 不是会话级
    │
-   └─ 再 47 分后        用这把 token 请求 duration → HTTP 200
-                        ⇒ 至少存活 12 小时 10 分，且跨过一次客户端重启
+   └─ 10-02 00:15  拿同一把请求 duration → HTTP 401 token expired
+                   ⇒ 寿命约 22 小时 51 分，按「一天」算
 ```
-
-**不是会话级 token**，重启不换新，至少按「天」计。
 
 ### 过期的表现
 
 ```
 HTTP 401   field1=401  field2=Unauthorized
-           field3=invalid auth token   （或 cipher: message authentication failed）
+           field3=token expired      （或 invalid auth token / cipher: message authentication failed）
 ```
 
-### 对守护进程的影响
+### 续期借客户端的手
 
-`watchdog.pause()` 只区分 `200` 和 `500`，401 会落到兜底分支，结果是：
+**客户端和 App 都有合法的续期逻辑** —— `spUtils.xml` 里的 `LAST_REFRESH_TOKEN_TIME`
+就是 App 自己写的。所以让「有续期能力的那一端」产出凭据，脚本只做搬运：
 
-- 日志里只有一行 `✗ 暂停失败 HTTP 401`，看不出是 token 失效
-- 没有任何告警，可能几天后才发现时长一直在被扣
+| 端 | 续期方式 | 依据 |
+|---|---|---|
+| 安卓 App | **按需自动刷新** | 存活期间它自己会改写 `LAST_REFRESH_TOKEN_TIME`；token 还新鲜时冷启动不会动它，说明是「按需」而非「定时」 |
+| PC 客户端 | **需重新登录** | 实测：token 过期后重启客户端，2 分钟内内存里始终抓不到 token |
 
-自愈的原料已经就绪：`etapi.py scan` 会自动提权重抓，0.4 秒完成。
+于是：
 
-> 待办（尚未实施）：给 `pause()` 加 401 分支，标记 `token-expired`、
-> 写醒目日志，并自动调 `scan` 重抓后重试一次。
+1. **模拟器端**：每次跑 checkin 都从 App 现读 token（App 自己会续），读一次就**复写**一次
+   `output/cred.json`，**连来源端一起存**（`os=1` + 现读的 `ver`）—— 光有 token
+   不知道该配哪组 x-eta，配错一律 401。`ver` 由 `android_ver()` 从
+   `dumpsys package` 现读，**不写死**：写死的话 App 一升级就全线 401。
+   **不看 token 变没变**：`saved` / `ts` 就是
+   「谁最新」的依据，跳过写入会让这份的时间戳停在旧值，选凭据时就轮不到它。
+2. **PC 端**：`watchdog` 读 `cred.json`，**按保存时间从新到旧探活** —— 谁最后被刷新过
+   谁最可能还有效。哪份通过用哪份，选中的会被钉住，后续请求按它的 os/ver 拼 x-eta。
+3. 撞上 401：模拟器端冷启动 App 逼它续期后再读一次；PC 端换另一份。都不行就打醒目日志。
+
+### 守护进程的自愈策略
+
+- **探活节奏**：启动时 + 每 30 分钟复检一次凭据（`resolve_cred()`），状态变化才写日志
+  （可用→不可用打 `⚠ 凭据不可用：…`，恢复时打 `✓ 凭据可用：…`）。复检被节流跳过时
+  沿用上次结论，所以 `--status` 看到的始终是最近一次真实探活的结果。
+- **补凭据**：自检发现两份都废 → 第一次轮询就立刻补，不干等 30 分钟。顺序是先 PC 后 App：
+  **① `etapi.py scan`**（提权读 PC 客户端内存，约 1 秒、**不启模拟器**）—— 客户端没在运行时
+  直接跳过这一步；扫不到就隔 5 秒重扫，共 3 次（token 明文只在请求头缓冲区里存活，
+  隔一会儿才有机会扫到）。走不通才 **② `checkin.py --renew-token`**（启模拟器借 App 的手，
+  约 1 分钟）。
+- **失效判定**：只有 401 才算凭据失效。`check_cred()` 返回三态：`True` 可用 / `False`
+  明确失效 / `None` 判断不了（没网、超时、5xx）。判断不了时既不报警也不去续期。
+- **就地重试**：`pause()` 撞上 401 会就地换凭据重试，不等周期复检 —— 暂停是关机 / 休眠
+  这类关键时刻才触发的，等不起。**关机 / 注销 / 睡眠走 `fast` 路径**：只发一次请求，
+  401 也不换凭据，超时收紧到 `fast_timeout`（2 秒），把请求压在 Windows 判「未响应」的
+  5 秒阈值以内。
+- **状态可见**：两份凭据全过期时打醒目日志，并以 `token-expired` 落进状态文件（`--status`
+  可见）；「末次结果」把 `no-token`（没有凭据文件）和 `net-error`（网络 / 连接失败）
+  分开显示。
+
+手动恢复两条路：跑一次 `etapi.py scan`（客户端在运行、登录态还在时），或跑一次 checkin
+（它会把 App 端的新 token 存下来）。
+
+> 待验证：token 真正到期时，App 冷启动能否换出新 token。这需要等真实的过期时刻
+> （伪造的坏 token 只会得到 `invalid auth token`，App 并不知道我们在用它）。
 
 ---
 
 ## 九、其它风险
 
-- 不要手动改 `resolution_mode=custom`（模拟器那边的事，与本文无关，一并提醒）。
+- `resolution_mode` 保持 `phone.1`（模拟器那边的事，与本文无关，一并提醒）。
 - 多设备登录可能顶号。服务端状态是账号级的，本方案不涉及并发登录，风险低。
 - 接口随时可能改，改了就重新挖一次，方法在第二节。
