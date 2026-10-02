@@ -5,6 +5,8 @@
   "adb_path": "<MuMu 安装目录>\\nx_main\\adb.exe",
   "mumu_vmindex": "0",
 
+  "venv": "<Python venv 根目录，形如 C:\\Users\\你\\.workbuddy\\binaries\\python\\envs\\default。guard 靠它的 Lib\\site-packages 挂 pywin32>",
+
   "serial": "127.0.0.1:16384",
 
   "oaid": "<任意 UUID，形如 00000000-0000-0000-0000-000000000000>",
