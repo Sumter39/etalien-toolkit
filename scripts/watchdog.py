@@ -1,26 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""外星仔加速器 · 时长守护进程
+"""外星仔加速器 · 时长守护进程。
 
-在四种「你已经不需要加速，但服务端还在扣时长」的情况下，
-自动向服务端上报一次暂停（POST /v2/account/update/pause/state  field1=1）：
+命中以下任一情况时，向服务端上报一次暂停
+（POST /v2/account/update/pause/state，field1=1）—— 这些场景下服务端仍在扣时长：
 
-  ① 关机 / 重启 / 注销   接系统 WM_QUERYENDSESSION，抢在被强杀之前发出去
-  ② 睡眠 / 休眠 / 合盖   接 WM_POWERBROADCAST(PBT_APMSUSPEND)
-  ③ 客户端进程退出       轮询 etalien.exe，「在 → 不在」的那一刻触发
-  ④ 锁屏 / 键鼠空闲超时  人已经离开电脑
+    ① 关机 / 重启 / 注销    WM_QUERYENDSESSION
+    ② 睡眠 / 休眠 / 合盖    WM_POWERBROADCAST(PBT_APMSUSPEND)
+    ③ 客户端进程退出        轮询 etalien.exe，检测「在 → 不在」
+    ④ 锁屏 / 键鼠空闲超时
 
-为什么不需要管理员权限：
-    暂停是纯服务端状态 —— 实测把客户端进程 taskkill 强杀之后，接口照样调得通。
-    本进程只发一个 HTTPS 请求，不碰客户端进程，所以不触发 UIPI 那条线。
+窗口：WM_POWERBROADCAST 只广播给顶层窗口，message-only 窗口收不到，所以必须建一个
+真正的顶层窗口，但保持隐藏（不 Show），不进任务栏也不进 Alt+Tab。
 
-为什么要建一个隐藏窗口：
-    WM_POWERBROADCAST 只广播给顶层窗口，message-only 窗口收不到，
-    所以必须建一个真正的顶层窗口，但保持隐藏（不 Show），不进任务栏也不进 Alt+Tab。
+权限：只发 HTTPS 请求，不碰客户端进程，因此不需要管理员权限。
 
 用法：
     pythonw watchdog.py             # 常驻（由注册表 Run 键拉起，无窗口）
-    python  watchdog.py --status    # 看运行状态 + 剩余时长
+    python  watchdog.py --status    # 运行状态 + 剩余时长
     python  watchdog.py --pause-now # 立刻暂停一次
     python  watchdog.py --stop      # 停掉
 """
@@ -54,7 +51,9 @@ CONFIG = {
     "process": "etalien.exe",       # 要盯的客户端进程
     "idle_seconds": CFG.get("idle_minutes") * 60,   # 键鼠空闲多久算「人走了」
     "poll_interval": 5,             # 轮询间隔（秒）
-    "http_timeout": 5,              # 暂停请求超时（关机窗口只有几秒，别设太长）
+    "http_timeout": 5,              # 暂停请求超时
+    "fast_timeout": 2,              # 关机/注销/睡眠路径专用：Windows 判「未响应」是 5 秒，
+                                    # 用 5 秒超时正好贴边，会弹「此应用阻止关机」
     "pause_path": "/v2/account/update/pause/state",
     "watch_process": True,          # 盯客户端进程退出
     "watch_lock": True,             # 盯锁屏
@@ -62,8 +61,8 @@ CONFIG = {
 }
 
 RUNNING = True
-_STATE = {"client": None, "locked": False, "idle": False,
-          "started": None, "last_event": None, "last_result": None}
+_STATE = {"client": None, "locked": False, "idle": False, "started": None,
+          "last_event": None, "last_result": None, "cred_ok": None, "cred": None}
 
 # ---------------------------------------------------------------- 系统常量
 
@@ -119,31 +118,190 @@ def save_state():
         pass
 
 
+# ---------------------------------------------------------------- 凭据
+
+
+_last_cred_check = 0.0
+CRED_RECHECK = 1800        # 凭据复检间隔（秒）
+
+
+def resolve_cred(force=False):
+    """挑一份还能用的凭据并钉住它；返回 (ok, 说明)。
+
+    `ok` 三态：True 有一份能用 / False 全部明确失效（401）/ None 判断不了（没网）。
+
+    token 过期后**没法自己续** —— `/v2/account/refresh/token` 要客户端签名，
+    算不出来（PC 客户端自己也不会刷新：实测重启客户端两分钟都不产出 token）。
+    所以只能「换一份」：output/cred.json 里通常有两份 ——
+
+        pc-client     etapi.py scan 抓的，客户端登录态还在时才刷新得出来
+        android-app   每天跑一次 checkin 时顺手存下的。App 自己带续期逻辑，这份活得久
+
+    **按保存时间从新到旧探活**：谁最后被刷新过，谁最可能还有效
+    （`scan` 刷 pc-client，签到每轮刷 android-app）。哪份通过就用哪份并钉住，
+    后续请求都照它的 os/ver 拼 x-eta。
+
+    **只有 401 才判失效**：网络不通 / 超时 / 5xx 一律算「未知」——这时既不该报警
+    （凭据可能是好的），更不该去启动模拟器续期（白折腾一分钟，网络恢复就好了）。
+    """
+    global _last_cred_check
+    now = time.time()
+    if not force and now - _last_cred_check < CRED_RECHECK:
+        # 跳过 ≠ 可用。必须沿用上次结论：否则「凭据全废」会被翻成「可用」，
+        # 既让 --status 报假象，又让 poll_loop 永远等不到 renew 的触发条件
+        # （它只在 ok is False 时才续期），等于白等一个复检周期。
+        return _STATE.get("cred_ok", True), \
+            "距上次复检不足 %d 分钟，沿用上次结论" % (CRED_RECHECK // 60)
+    _last_cred_check = now
+
+    creds = E.load_creds()
+    if not creds:
+        return False, "没有凭据（先跑 etapi.py scan，或跑一次 checkin）"
+    dead, unknown = [], []
+    for c in sorted(creds.values(), key=E.cred_rank):
+        r = E.check_cred(c["src"])
+        if r.get("ok"):
+            E.prefer_cred(c["src"])
+            return True, "%s（%s 存）" % (c["src"], c.get("saved"))
+        note = "%s %s" % (c["src"], r.get("reason") or r.get("status"))
+        (unknown if r.get("ok") is None else dead).append(note)
+    if dead:
+        return False, "凭据全部失效：" + "；".join(dead)
+    return None, "判断不了（非 401）：" + "；".join(unknown)
+
+
+RENEW_GAP = 1800           # 两次「补凭据」之间的最小间隔（秒）
+SCAN_TRIES = 3             # 重抓 PC 端时扫几次
+SCAN_GAP = 5               # 两次扫描之间的间隔（秒）
+_last_renew = 0.0
+
+
+def _run_child(name, args, timeout):
+    """跑同目录下的脚本，返回 (退出码, 输出末行)。"""
+    here = os.path.dirname(os.path.abspath(__file__))
+    script = os.path.join(here, name)
+    if not os.path.exists(script):
+        return 127, "找不到 %s" % name
+    py = os.path.join(os.path.dirname(sys.executable), "python.exe")
+    if not os.path.exists(py):
+        py = sys.executable
+    try:
+        r = subprocess.run([py, script] + args, cwd=here, capture_output=True,
+                           timeout=timeout, creationflags=subprocess.CREATE_NO_WINDOW)
+    except Exception as e:
+        return -1, "%s: %s" % (type(e).__name__, e)
+    tail = (r.stdout or b"").decode("utf-8", "ignore").strip().splitlines()
+    return r.returncode, (tail[-1] if tail else "")
+
+
+def renew_cred():
+    """两份凭据都失效时补一份新的 —— 能不动模拟器就不动。
+
+    顺序和 `cred_rank()` 同一原则，先 PC 后 App：
+
+    1. `etapi.py scan` —— 提权读 PC 客户端内存抓它当前的 token，约 1 秒，
+       **不启模拟器**。客户端在跑且发过请求时走得通。token 明文只在请求头
+       缓冲区里存活，会被回收 / 换页，所以隔几秒连扫 SCAN_TRIES 次。
+       客户端没在运行时直接跳过这一步（没有内存可读，扫了也是空手而归）。
+    2. `checkin.py --renew-token` —— 启模拟器借 App 的手续一份，约 1 分钟。
+       上面那条走不通（客户端没开 / 内存里没有现成 token）才走这条。
+
+    ⚠ 只能在 poll_loop（独立线程）里调用：最坏会阻塞一分钟以上，绝不能放进
+    主线程的关机 / 休眠处理里 —— 那时候离断电只剩几秒。
+    """
+    global _last_renew
+    now = time.time()
+    if now - _last_renew < RENEW_GAP:
+        return False, "距上次尝试不足 %d 分钟，跳过" % (RENEW_GAP // 60)
+    _last_renew = now
+
+    # 客户端没开就没有内存可读，scan 会进门就退（退出码 1）。先探一下进程：
+    # 否则 SCAN_TRIES 次秒退 + 中间两次 SCAN_GAP 等待全白费（约 12 秒）。
+    if not E._pid():
+        log("PC 客户端没在运行，重抓无从谈起 → 直接启动模拟器借 App 续期…")
+    else:
+        log("凭据全部失效 —— 先试提权重抓 PC 客户端（不启模拟器）…")
+        rc, tail = 1, ""
+        for i in range(SCAN_TRIES):
+            rc, tail = _run_child("etapi.py", ["scan"], timeout=120)
+            if rc == 0 and E.check_cred("pc-client").get("ok"):
+                return True, "重抓 PC 端成功"
+            if i < SCAN_TRIES - 1:
+                time.sleep(SCAN_GAP)     # 同一次调用内内存不会变，只能隔一会儿重扫
+        why = tail if rc != 0 else "重抓到的那份不顶用"
+        log("· PC 端补不上（%s）→ 启动模拟器借 App 续期（约 1 分钟，期间别断电）…" % why)
+
+    rc, tail = _run_child("checkin.py", ["--renew-token"], timeout=300)
+    if rc != 0:
+        return False, "续期失败：%s" % (tail or "退出码 %s" % rc)
+    return True, "借 App 续期成功"
+
+
 # ---------------------------------------------------------------- 核心动作
 
 
-def pause(reason):
-    """上报一次「暂停计时」。已经是暂停状态时服务端返回 500，属正常。"""
-    body = E.pb_v(1, 1) if hasattr(E, "pb_v") else b"\x08\x01"
+def pause(reason, fast=False):
+    """上报一次「暂停计时」。已经是暂停状态时服务端返回 500，属正常。
+
+    请求尽量短命：暂停晚到一秒，就多扣一秒。所以撞上 401 不等 30 分钟的
+    周期复检，就地换一份凭据重试 —— 复检默认半小时一次，期间关机/休眠触发的
+    暂停会次次扑空，时长照扣。
+
+    `fast=True` 给「系统正在等我点头」的路径用（关机 / 注销 / 睡眠）。那条路上
+    只发一次请求、且超时收紧到 `fast_timeout`（2s）：换凭据要先探活
+    （HTTP 超时 5~10s，最坏还得启一次模拟器），而 Windows 判「未响应」的阈值
+    就是 5 秒，拖过去会弹「此应用阻止关机」，比漏报一次更糟。
+    凭据失效本来就该由 poll_loop 的周期复检提前发现，不该赌在关机的几秒里。
+    """
+    body = E.pb_v(1, 1)          # field1=1：暂停
     t0 = time.time()
-    try:
-        st, raw = E.call(CONFIG["pause_path"], body, timeout=CONFIG["http_timeout"])
-    except SystemExit as e:                     # 没有 token
-        log("✗ 暂停失败 [%s]：%s" % (reason, e))
-        _STATE["last_event"] = reason
-        _STATE["last_result"] = "no-token"
+
+    def send(timeout):
+        """打一次暂停接口，返回 (状态码, 原始响应, 失败归类)。
+
+        两种「状态码为 None」必须分开：没有凭据文件、和网络/连接层异常。
+        混用同一个名字会让 --status 把断网报成「没有凭据」。
+        """
+        try:
+            st, raw = E.call(CONFIG["pause_path"], body, timeout=timeout)
+            return st, raw, None
+        except SystemExit as e:                 # 没有凭据文件
+            return None, str(e), "no-token"
+        except Exception as e:
+            return None, "%s: %s" % (type(e).__name__, e), "net-error"
+
+    timeout = CONFIG["fast_timeout"] if fast else CONFIG["http_timeout"]
+    _STATE["last_event"] = reason
+    st, raw, kind = send(timeout)
+    if st is None:
+        log("✗ 暂停失败 [%s]：%s" % (reason, raw))
+        _STATE["last_result"] = kind
         save_state()
         return False
-    except Exception as e:
-        log("✗ 暂停失败 [%s]：%s: %s" % (reason, type(e).__name__, e))
-        _STATE["last_event"] = reason
-        _STATE["last_result"] = "error"
-        save_state()
-        return False
+
+    if st == 401:
+        if fast:
+            log("✗ 暂停失败 [%s]  HTTP 401 —— 系统等我结束会话，不换凭据直接放行" % reason)
+            _STATE["last_result"] = "token-expired"
+            save_state()
+            return False
+        log("· 凭据失效（HTTP 401），换一份可用凭据重试…")
+        if resolve_cred(force=True)[0]:
+            st, raw, kind = send(timeout)
+            if st is None:
+                log("✗ 暂停失败 [%s]：%s" % (reason, raw))
+                _STATE["last_result"] = kind
+                save_state()
+                return False
+        if st == 401:
+            # 两份凭据全都过期 = 只能人工介入（跑一次 checkin 让 App 续，或重新登录）
+            log("✗✗ 暂停失败 [%s]  HTTP 401 凭据全部失效 —— 时长会继续被扣！"
+                "跑一次 `checkin.py` 让 App 续期，或重新登录客户端" % reason)
+            _STATE["last_result"] = "token-expired"
+            save_state()
+            return False
 
     ms = int((time.time() - t0) * 1000)
-    _STATE["last_event"] = reason
-
     if st == 200:
         log("✓ 已暂停计时 [%s]  HTTP 200  %dms" % (reason, ms))
         _STATE["last_result"] = "paused"
@@ -309,6 +467,26 @@ def poll_loop():
             elif cur_lock:
                 st["idle"] = False
 
+            # ④ 凭据复检（默认 30 分钟一次）—— 只在状态变化时吱声，避免刷日志
+            ok, why = resolve_cred()
+            if ok is False:
+                # 手里两份都废了 → 借 App 的手续一份。必须赶在复检时做，不能等关机
+                # 那一刻：那时只剩几秒，启模拟器根本来不及，只能白扣一次时长。
+                # 只在**明确 401** 时做：网络不通（ok=None）不代表凭据废了。
+                if renew_cred()[0]:
+                    ok, why = resolve_cred(force=True)
+            if ok != _STATE.get("cred_ok"):
+                _STATE["cred_ok"] = ok
+                _STATE["cred"] = why
+                save_state()
+                if ok:
+                    mark = "✓ 凭据可用："
+                elif ok is False:
+                    mark = "⚠ 凭据不可用："
+                else:
+                    mark = "· 凭据状态未知："
+                log(mark + why)
+
         except Exception as e:
             log("轮询异常：%s: %s" % (type(e).__name__, e))
 
@@ -324,17 +502,17 @@ def wndproc(hwnd, msg, wparam, lparam):
         if msg == WM_QUERYENDSESSION:
             kind = "注销" if (lparam & ENDSESSION_LOGOFF) else "关机/重启"
             log("⚠ 收到系统结束会话通知（%s），抢时间发送暂停" % kind)
-            pause("系统" + kind)
+            pause("系统" + kind, fast=True)
             return 1                       # TRUE：同意继续关机
         if msg == WM_ENDSESSION:
             if wparam:
                 log("⚠ 会话即将结束，兜底再报一次")
-                pause("会话结束兜底")
+                pause("会话结束兜底", fast=True)
             return 0
         if msg == WM_POWERBROADCAST:
             if wparam == PBT_APMSUSPEND:
                 log("⚠ 系统即将睡眠/休眠，发送暂停")
-                pause("睡眠/休眠")
+                pause("睡眠/休眠", fast=True)
             elif wparam in (PBT_APMRESUMESUSPEND, PBT_APMRESUMEAUTOMATIC):
                 log("· 系统已从睡眠中恢复")
             return 1
@@ -399,6 +577,14 @@ def clean_pid():
 
 # ---------------------------------------------------------------- 子命令
 
+RESULT_TEXT = {                  # 「末次结果」原值 → 人话
+    "paused": "已暂停",
+    "already-paused": "本来就是暂停态",
+    "token-expired": "凭据过期或失效",
+    "no-token": "没有凭据文件",
+    "net-error": "网络/连接失败",
+}
+
 
 def cmd_status():
     running = "运行中" if acquire_lock() is None else "未运行"
@@ -410,7 +596,8 @@ def cmd_status():
             print("  客户端   :", "在运行" if d.get("client") else "未运行")
             print("  屏幕     :", "已锁" if d.get("locked") else "未锁")
             print("  末次触发 :", d.get("last_event") or "（还没触发过）")
-            print("  末次结果 :", d.get("last_result") or "-")
+            code = d.get("last_result")
+            print("  末次结果 :", RESULT_TEXT.get(code, code) if code else "-")
         except Exception as e:
             print("  状态文件读取失败:", e)
 
@@ -418,12 +605,20 @@ def cmd_status():
     print("  实时锁屏 :", "是" if is_locked() else "否")
     print("  客户端   :", "在运行" if client_running() else "未运行")
 
-    st, raw = E.call("/v2/account/remain/duration", timeout=15)
-    if st == 200:
-        fs = {f: v for f, k, v in E.pb_decode(raw) if k == "varint"}
-        print("  剩余时长 :", E.fmt_dur(fs.get(1, 0)))
+    ok, why = resolve_cred(force=True)
+    if ok:
+        print("  凭据     : 可用 " + why)
+    elif ok is False:
+        print("  凭据     : 不可用 " + why)
     else:
-        print("  剩余时长 : 查询失败 HTTP %s" % st)
+        print("  凭据     : 未知 " + why)
+    if ok:
+        st, raw = E.call("/v2/account/remain/duration", timeout=15)
+        if st == 200:
+            fs = {f: v for f, k, v in E.pb_decode(raw) if k == "varint"}
+            print("  剩余时长 :", E.fmt_dur(fs.get(1, 0)))
+        else:
+            print("  剩余时长 : 查询失败 HTTP %s" % st)
 
     print("  日志     :", LOG_FILE)
 
@@ -556,14 +751,21 @@ def main():
     log("监测项：关机/重启、睡眠/休眠、客户端退出、锁屏、键鼠空闲>%d分钟"
         % (CONFIG["idle_seconds"] // 60))
 
-    # token 自检 —— 失效必须让人看见，不能默默装死
-    st, raw = E.call("/v2/account/remain/duration", timeout=15)
-    if st == 200:
-        fs = {f: v for f, k, v in E.pb_decode(raw) if k == "varint"}
-        log("凭据有效，当前剩余时长 %s" % E.fmt_dur(fs.get(1, 0)))
+    # 凭据自检 —— 失效必须让人看见，不能默默装死
+    ok, why = resolve_cred(force=True)
+    _STATE["cred_ok"], _STATE["cred"] = ok, why
+    if ok:
+        log("凭据可用：%s" % why)
+        st, raw = E.call("/v2/account/remain/duration", timeout=15)
+        if st == 200:
+            fs = {f: v for f, k, v in E.pb_decode(raw) if k == "varint"}
+            log("当前剩余时长 %s" % E.fmt_dur(fs.get(1, 0)))
+    elif ok is False:
+        log("⚠ %s —— 暂停功能会失效" % why)
+        log("  恢复办法：跑一次 `etapi.py scan`（客户端在运行时），"
+            "或跑一次 checkin（它会顺手存下模拟器端 App 的 token）")
     else:
-        log("⚠ 凭据自检失败 HTTP %s %r —— 暂停功能会失效，需要重新抓 token"
-            % (st, raw[:120]))
+        log("· %s —— 稍后自动重试（不报警、也不去续期）" % why)
 
     write_pid()
     atexit.register(clean_pid)
