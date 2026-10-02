@@ -89,7 +89,7 @@ POST /v2/account/update/pause/state   field1=1  →  HTTP 200
 
 ## 四、覆盖的四个场景
 
-`scripts/watchdog.py` 常驻后台，隐藏窗口，无界面。
+`src/scripts/guard.py` 常驻后台，隐藏窗口，无界面。
 
 | 场景 | 怎么感知 | 实测响应 |
 |---|---|---|
@@ -124,25 +124,25 @@ export PYTHONIOENCODING=utf-8
 
 PY=python                              # 或你的虚拟环境解释器
 
-$PY scripts/watchdog.py --install      # 装开机自启（写注册表 Run 键）
-$PY scripts/watchdog.py                # 前台跑（Ctrl+C 停）
-$PY scripts/watchdog.py --status       # 看状态 + 剩余时长
-$PY scripts/watchdog.py --pause-now    # 手动暂停一次
-$PY scripts/watchdog.py --stop         # 停掉守护
-$PY scripts/watchdog.py --idle-min 30  # 改空闲阈值（默认 15 分钟）
-$PY scripts/watchdog.py --uninstall    # 移除自启
+$PY src/scripts/guard.py --install      # 装开机自启（写注册表 Run 键）
+$PY src/scripts/guard.py                # 前台跑（Ctrl+C 停）
+$PY src/scripts/guard.py --status       # 看状态 + 剩余时长
+$PY src/scripts/guard.py --pause-now    # 手动暂停一次
+$PY src/scripts/guard.py --stop         # 停掉守护
+$PY src/scripts/guard.py --idle-min 30  # 改空闲阈值（默认 15 分钟）
+$PY src/scripts/guard.py --uninstall    # 移除自启
 
-$PY scripts/etapi.py duration          # 查剩余时长（直接用 cred.json 里的 token 查）
+$PY src/tools/etapi.py duration          # 查剩余时长（直接用 cred.json 里的 token 查）
 ```
 
 ### 凭据失效时怎么补
 
-两条路，**先试第一条**（`watchdog` 自动补凭据时也是这个顺序）：
+两条路，**先试第一条**（`guard` 自动补凭据时也是这个顺序）：
 
 **① 提权重抓 PC 客户端的 token**（约 1 秒）：
 
 ```bash
-$PY scripts/etapi.py scan
+$PY src/tools/etapi.py scan
 ```
 
 一条命令搞定，提权自动完成。它会：
@@ -157,7 +157,7 @@ $PY scripts/etapi.py scan
 存进 `output/cred.json`：
 
 ```bash
-$PY scripts/checkin.py --renew-token
+$PY src/scripts/adwatch.py --renew-token
 ```
 
 实测输出：
@@ -261,13 +261,13 @@ HTTP 401   field1=401  field2=Unauthorized
 
 于是：
 
-1. **模拟器端**：每次跑 checkin 都从 App 现读 token（App 自己会续），读一次就**复写**一次
+1. **模拟器端**：每次跑 adwatch 都从 App 现读 token（App 自己会续），读一次就**复写**一次
    `output/cred.json`，**连来源端一起存**（`os=1` + 现读的 `ver`）—— 光有 token
    不知道该配哪组 x-eta，配错一律 401。`ver` 由 `android_ver()` 从
    `dumpsys package` 现读，**不写死**：写死的话 App 一升级就全线 401。
    **不看 token 变没变**：`saved` / `ts` 就是
    「谁最新」的依据，跳过写入会让这份的时间戳停在旧值，选凭据时就轮不到它。
-2. **PC 端**：`watchdog` 读 `cred.json`，**按保存时间从新到旧探活** —— 谁最后被刷新过
+2. **PC 端**：`guard` 读 `cred.json`，**按保存时间从新到旧探活** —— 谁最后被刷新过
    谁最可能还有效。哪份通过用哪份，选中的会被钉住，后续请求按它的 os/ver 拼 x-eta。
 3. 撞上 401：模拟器端冷启动 App 逼它续期后再读一次；PC 端换另一份。都不行就打醒目日志。
 
@@ -279,7 +279,7 @@ HTTP 401   field1=401  field2=Unauthorized
 - **补凭据**：自检发现两份都废 → 第一次轮询就立刻补，不干等 30 分钟。顺序是先 PC 后 App：
   **① `etapi.py scan`**（提权读 PC 客户端内存，约 1 秒、**不启模拟器**）—— 客户端没在运行时
   直接跳过这一步；扫不到就隔 5 秒重扫，共 3 次（token 明文只在请求头缓冲区里存活，
-  隔一会儿才有机会扫到）。走不通才 **② `checkin.py --renew-token`**（启模拟器借 App 的手，
+  隔一会儿才有机会扫到）。走不通才 **② `adwatch.py --renew-token`**（启模拟器借 App 的手，
   约 1 分钟）。
 - **失效判定**：只有 401 才算凭据失效。`check_cred()` 返回三态：`True` 可用 / `False`
   明确失效 / `None` 判断不了（没网、超时、5xx）。判断不了时既不报警也不去续期。
@@ -291,7 +291,7 @@ HTTP 401   field1=401  field2=Unauthorized
   可见）；「末次结果」把 `no-token`（没有凭据文件）和 `net-error`（网络 / 连接失败）
   分开显示。
 
-手动恢复两条路：跑一次 `etapi.py scan`（客户端在运行、登录态还在时），或跑一次 checkin
+手动恢复两条路：跑一次 `src/tools/etapi.py scan`（客户端在运行、登录态还在时），或跑一次 adwatch
 （它会把 App 端的新 token 存下来）。
 
 > 待验证：token 真正到期时，App 冷启动能否换出新 token。这需要等真实的过期时刻
