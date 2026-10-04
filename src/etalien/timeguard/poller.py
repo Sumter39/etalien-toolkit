@@ -1,14 +1,15 @@
 # -*- coding: utf-8 -*-
-"""轮询线程：客户端退出、锁屏、键鼠空闲、凭据复检、暂停补发。
+"""轮询线程：客户端退出、锁屏、键鼠空闲、凭据复检、DNS 补预热。
 
-这四条和窗口消息走的是两条路：窗口消息管系统级事件（关机/睡眠），
+这几条和窗口消息走的是两条路：窗口消息管系统级事件（关机/睡眠），
 轮询管用户态事件（退出客户端/锁屏/闲置），两者互不替代。
 """
 import time
 
+from .. import api
 from . import probe
 from .creds import renew_cred, resolve_cred
-from .pauser import need_repause, pause, reset_pause_gate
+from .pauser import pause
 from .settings import CONFIG
 from .state import STOP, _STATE, log, save_state
 
@@ -26,7 +27,6 @@ def poll_loop():
                 cur = probe.client_running()
                 if st["client"] and not cur:
                     log("→ 客户端进程已退出")
-                    reset_pause_gate()
                     pause("客户端退出", channel="轮询/客户端退出")
                 elif not st["client"] and cur:
                     log("→ 客户端已重新启动，继续监测")
@@ -39,7 +39,6 @@ def poll_loop():
             if CONFIG["watch_lock"] and cur_lock != st["locked"]:
                 if cur_lock:
                     log("→ 屏幕已锁定")
-                    reset_pause_gate()
                     pause("锁屏", channel="轮询/锁屏")
                 else:
                     log("→ 屏幕已解锁")
@@ -58,7 +57,6 @@ def poll_loop():
                     idle = probe.idle_seconds()
                     if idle >= CONFIG["idle_seconds"] and not st["idle"]:
                         log("→ 键鼠已空闲 %.0f 分钟" % (idle / 60))
-                        reset_pause_gate()
                         pause("空闲%.0f分钟" % (idle / 60), channel="轮询/空闲")
                         st["idle"] = True
                     elif idle < 60 and st["idle"]:
@@ -86,10 +84,11 @@ def poll_loop():
                     mark = "· 凭据状态未知："
                 log(mark + why)
 
-            # ⑤ 补发：期望暂停却没落实（关机那次漏发、或当时网络不通）→ 退避重试
-            if need_repause():
-                reset_pause_gate()
-                pause(_STATE.get("last_event") or "补发", channel="轮询/补发")
+            # ⑤ DNS 补预热：开机自启时网络还没就绪，启动那次必然失败；缓存不热，
+            #    关机时就只能去撞一个不可取消的 getaddrinfo，暂停大概率发不出去。
+            if not api.dns_ready():
+                if api.prewarm():
+                    log("✓ DNS 预热补上了")
 
         except Exception as e:
             log("轮询异常：%s: %s" % (type(e).__name__, e))

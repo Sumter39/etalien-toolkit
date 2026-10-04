@@ -17,4 +17,4 @@ from .creds import (ANDROID_OS, CRED_FILE, DVC_FILE, PC_OS, PC_VER, cred_rank,
 from .endpoints import check_cred, pause_state
 from .memscan import SCAN_RESULT, client_pid, is_admin, scan, scan_elevated, scan_job
 from .proto import decode, field, fmt_dur, varint
-from .transport import BASE, call, install_dns_timeout, prewarm
+from .transport import BASE, call, dns_ready, prewarm

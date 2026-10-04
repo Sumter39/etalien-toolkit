@@ -15,9 +15,9 @@ from .. import config as cfg
 from ..procs import run
 from . import poller, probe, window
 from .creds import resolve_cred
-from .pauser import pause, startup_check
+from .pauser import pause
 from .settings import CONFIG
-from .state import LOG_FILE, PID_FILE, STATE_FILE, STOP, _STATE, load_pending, log
+from .state import LOG_FILE, PID_FILE, STATE_FILE, STOP, _STATE, log
 
 LOCK_PORT = 47651          # 单实例锁（本地回环端口，不占权限）
 
@@ -73,10 +73,6 @@ def cmd_status():
         except Exception as e:
             print("  状态文件读取失败:", e)
 
-    pend = load_pending()
-    if pend:
-        print("  欠一次暂停: %s @ %s（等补发）" % (pend["reason"], pend["at"]))
-
     # 环境类字段一律现算，不信快照文件 —— 文件是运行中进程写的，
     # 而任何临时进程（比如测试）覆盖它之后，守护进程只在「状态变化」时才重写，
     # 于是文件可能长期停留在错误值上，把 --status 变成假象。
@@ -110,19 +106,11 @@ def cmd_pause_now():
 def _launch_cmdline():
     r"""Run 键要写的命令行。
 
-    必须指向基础解释器（sys.base_prefix），不能用 venv 的 Scripts\pythonw.exe ——
-    那是个转发器，它会为真正的解释器子进程建一个 kill-on-close 的作业对象，
-    而它自己是个无窗口进程，关机时会被系统提前结束：作业关闭 → 子进程被
-    TerminateProcess 强杀，连一条日志都写不出，暂停请求永远发不出去
-    （2026-10-02/03 四次关机失败的真因）。基础解释器直连没有这层父子绑定，
-    进程能活到把请求发完。
-
-    脚本路径取 sys.argv[0]（当初被执行的那个入口），不是本模块的路径 ——
-    把 Run 键指向包内文件，解释器会拿它当普通模块跑，__main__ 逻辑不会触发。
+    必须指向基础解释器的 pythonw.exe，脚本路径取 sys.argv[0]（当初被执行的那个
+    入口），不是本模块的路径 —— 把 Run 键指向包内文件，解释器会拿它当普通模块跑，
+    __main__ 逻辑不会触发。
     """
     pyw = os.path.join(sys.base_prefix, "pythonw.exe")
-    if not os.path.exists(pyw):
-        pyw = sys.executable
     return '"%s" "%s"' % (pyw, os.path.abspath(sys.argv[0]))
 
 
@@ -192,7 +180,6 @@ def main():
     ap.add_argument("--process", default=CONFIG["process"],
                     help="要盯的客户端进程名（默认 etalien.exe）")
     a = ap.parse_args()
-    api.install_dns_timeout(CONFIG["fast_timeout"])
 
     if a.stop:
         return cmd_stop()
@@ -222,8 +209,10 @@ def main():
     log("监测项：关机/重启、睡眠/休眠、客户端退出、锁屏、键鼠空闲>%d分钟"
         % (CONFIG["idle_seconds"] // 60))
 
-    # 先把 DNS 解析好缓存起来，关机时网络组件已被拆，那时不必再去碰解析
-    api.prewarm()
+    # 先把 DNS 解析好缓存起来，关机时网络组件已被拆，那时不必再去碰解析。
+    # 开机自启时网络常常还没就绪，这里失败很正常，交给轮询重试。
+    if not api.prewarm():
+        log("⚠ DNS 预热失败（开机自启时网络多半还没就绪）—— 轮询里会重试")
 
     # 凭据自检 —— 失效必须让人看见，不能默默装死
     ok, why = resolve_cred(force=True)
@@ -243,8 +232,6 @@ def main():
 
     write_pid()
     atexit.register(clean_pid)
-
-    startup_check()
 
     threading.Thread(target=poller.poll_loop, daemon=True).start()
 
