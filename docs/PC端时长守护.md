@@ -93,12 +93,12 @@ POST /v2/account/update/pause/state   field1=1  →  HTTP 200
 
 | 场景 | 怎么感知 | 实测响应 |
 |---|---|---|
-| 关机 / 重启 / 注销 | `WM_QUERYENDSESSION` | 117 ms |
+| 关机 / 重启 / 注销 | `WM_QUERYENDSESSION` | 83 ms |
 | 睡眠 / 休眠 / 合盖 | `WM_POWERBROADCAST` | 79 ms |
-| 退出客户端 | 轮询进程表 | 141 ms |
-| 锁屏 / 键鼠空闲超阈值 | `LogonUI.exe` + `GetLastInputInfo` | 126 ms |
+| 退出客户端 | 轮询进程表 | 95 ms |
+| 锁屏 / 键鼠空闲超阈值 | `LogonUI.exe` + `GetLastInputInfo` | 84 ms |
 
-关机只给 5 秒窗口，这里都在一百多毫秒，余量充足。
+关机只给 5 秒窗口，这里都在 100 毫秒以内，余量充足。
 
 **不需要管理员权限**：暂停是纯服务端状态，本进程只发一个 HTTPS 请求，
 不碰客户端进程，不触发 UIPI。
@@ -223,24 +223,32 @@ HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Run\EtalienTimeGuard
 | 2 | 篡改任意一位 → `401 cipher: message authentication failed` | 带 MAC 的自包含凭据（AES-GCM 一类），不是随机 session id |
 | 3 | 格式错 → `401 invalid auth token` | 服务端先解密再校验，两类失败分得清 |
 | 4 | app.so 里有 `get:tokenExpired` getter | 客户端确实有「过期」这个状态位 |
-| 5 | 有 `/v2/account/refresh/token`，但要 `sig` 签名 | 缺签名回 `403 invalid sign, check the "sig" parameter`；算法在客户端里 ⇒ 续期由客户端和 App 完成，脚本只做搬运 |
+| 5 | 有 `/v2/account/refresh/token`，但要 `sig` 签名 | 缺签名回 `403 invalid sign, check the "sig" parameter`；算法在客户端里，脚本算不出来 |
 | 6 | 提权读内存，全局搜 `expireTime` / `expiresDate` / `tokenExpired` | 命中的全是 Dart 类名字符串池、证书 Pin Rules、WebView Cookie，没有任何一处存着过期时间 |
 | 7 | 内存里 token 明文只出现在请求头缓存里 | 全是 HTTP 请求头缓存，旁边没有时间字段。实测同一时刻 5 处：`authorization:` 2 处 + `Authorization:` 3 处 —— 大小写两种都有，所以搜它必须 `re.I` |
 | 8 | 本地 Hive 库（`user_login_info.hive`）是 `HiveAesCipher` 加密 | 密钥运行时才取（`fetchEncryptKey`），本地读不出 |
 
 第 4、6 条合起来说明：客户端手里只有「过期了没有」这个布尔值，没有「什么时候过期」——
-撞上 401 才知道，所以续期必须由客户端发起。
+撞上 401 才知道。
 
 ### 实测存活时长
 
 ```
-10-01 01:24:35   签发
+10-01 01:24:35  App 那份签发
    │
-   ├─ 跨过一次客户端重启，token 没换 ⇒ 不是会话级
-   │
-   └─ 10-02 00:15  拿同一把请求 duration → HTTP 401 token expired
-                   ⇒ 寿命约 22 小时 51 分，按「一天」算
+   └─ 10-02 00:15  同账号另一次登录把本机顶掉 → 401  ← 这次是顶号导致，不是自然到期
 ```
+
+| 凭据 | 存于 | 复检时刻 | 间隔 | 结果 |
+|---|---|---|---|---|
+| `pc-client` | 10-02 14:31 | 10-05 03:14 | 60 小时 | `401 token expired` |
+| `android-app` | 10-05 00:33 | 10-05 15:20 | 15 小时 | `HTTP 200` |
+
+寿命由服务端掌握、不固定。上表只说明「PC 那份至少能活 15 小时且 60 小时后已死」，
+精确上限未知 —— 不要再拿单点间隔当寿命规律。
+
+**「签发时间」也读不到**：内存里没有过期时间字段，本地库又是加密的，
+所以只能靠「上一次探活通过是什么时候」来估算下限。
 
 ### 过期的表现
 
@@ -249,17 +257,36 @@ HTTP 401   field1=401  field2=Unauthorized
            field3=token expired      （或 invalid auth token / cipher: message authentication failed）
 ```
 
-### 续期借客户端的手
+### 续期能力：两端不一样
 
-**客户端和 App 都有合法的续期逻辑** —— `spUtils.xml` 里的 `LAST_REFRESH_TOKEN_TIME`
-就是 App 自己写的。所以让「有续期能力的那一端」产出凭据，脚本只做搬运：
-
-| 端 | 续期方式 | 依据 |
+| 端 | 续租逻辑 | 依据 |
 |---|---|---|
-| 安卓 App | **按需自动刷新** | 存活期间它自己会改写 `LAST_REFRESH_TOKEN_TIME`；token 还新鲜时冷启动不会动它，说明是「按需」而非「定时」 |
-| PC 客户端 | **需重新登录** | 实测：token 过期后重启客户端，2 分钟内内存里始终抓不到 token |
+| 安卓 App | **有。距上次续租满 24 小时、且冷启动时才调一次** | 反编译 `ETMyUserProfileManager.N()`：读 `LAST_REFRESH_TOKEN_TIME`，`interval >= 86400000` 才请求 `refresh/token`；唯一调用点是 `MainActivity.initData()` |
+| PC 客户端 | **没有** | `app.so`（12 MB Dart AOT）的全量 `/v2/...` 路径表里**不含** `refresh/token`；实测杀进程冷启动后 token 一字未变 |
 
-于是：
+**「冷启动才触发」是实测结论**：App 的续租检查挂在 `MainActivity` 初始化上，一直开着
+不关并不会续；只有冷启动一次、且距上次续租超 24 小时，才会去换。
+PC 端连这个检查点都没有，**token 过期只能重新登录**。
+
+PC 端冷启动实验（10-05 03:18）：
+
+```
+杀 etalien.exe（提权）→ 不重新登录、直接冷启动 → etapi.py scan
+  token md5  5d036bf97ed74a1e  →  5d036bf97ed74a1e   没变
+  再等 60 秒扫描                      5d036bf97ed74a1e   还是没变
+```
+
+对照组：10-05 03:13 那次 token 从 `zcziZiz-…` 变成 `9NpkFyt0…`，是**人工重新登录**换的。
+
+> 拉起 `etalien.exe` 做实验的坑：它 manifest 是 `requireAdministrator`，
+> `taskkill` 与 `subprocess.Popen` 都要提权（后者起的子进程还会被作业对象连坐杀掉）；
+> WMI `Win32_Process.Create` 也起不动（`ReturnValue=8`）。
+> **只有 COM `Schedule.Service` + `RunLevel=1` 有效** —— 任务由 `svchost` 建进程，
+> 脱离一切作业对象。
+
+### 于是补凭据这样做
+
+脚本只做搬运，让**有续期能力的那一端**产出凭据：
 
 1. **模拟器端**：每次跑 adwatch 都从 App 现读 token（App 自己会续），读一次就**复写**一次
    `output/cred.json`，**连来源端一起存**（`os=1` + 现读的 `ver`）—— 光有 token
@@ -269,7 +296,8 @@ HTTP 401   field1=401  field2=Unauthorized
    「谁最新」的依据，跳过写入会让这份的时间戳停在旧值，选凭据时就轮不到它。
 2. **PC 端**：`guard` 读 `cred.json`，**按保存时间从新到旧探活** —— 谁最后被刷新过
    谁最可能还有效。哪份通过用哪份，选中的会被钉住，后续请求按它的 os/ver 拼 x-eta。
-3. 撞上 401：模拟器端冷启动 App 逼它续期后再读一次；PC 端换另一份。都不行就打醒目日志。
+3. 撞上 401：模拟器端冷启动 App 逼它续期后再读一次；PC 端只能**重新登录**客户端，
+   再用 `etapi.py scan` 抓一份新的。都不行就打醒目日志。
 
 ### 守护进程的自愈策略
 
@@ -292,14 +320,65 @@ HTTP 401   field1=401  field2=Unauthorized
   分开显示。
 
 手动恢复两条路：跑一次 `src/tools/etapi.py scan`（客户端在运行、登录态还在时），或跑一次 adwatch
-（它会把 App 端的新 token 存下来）。
-
-> 待验证：token 真正到期时，App 冷启动能否换出新 token。这需要等真实的过期时刻
-> （伪造的坏 token 只会得到 `invalid auth token`，App 并不知道我们在用它）。
+（它会把 App 端的新 token 存下来）。PC 端那份过期后 `scan` 也抓不到 —— 必须先在客户端里重新登录。
 
 ---
 
-## 九、其它风险
+## 九、暂停的可靠性与闸门
+
+### 并发闸门
+
+消息循环（关机 / 睡眠）和轮询线程（客户端退出 / 锁屏 / 空闲）都可能在同一刻喊暂停。
+靠 `pauser._claim_pause()` 抢闸门：只有一条真正发请求，其余让位（返回 `None`）。
+不加锁就会各发一次，服务端虽然幂等，但白占关机窗口里宝贵的时间。
+
+**免重发窗口带失效时间**（`DONE_OK_TTL = 3.0` 秒）：发成功后 3 秒内后续触发直接让位，
+用来吸收 `WM_QUERYENDSESSION` 和紧随其后的 `WM_ENDSESSION` 这对重复通知。
+过期自动失效。
+
+> 这个 TTL 是修 bug 加的。原实现是个**没有时效的布尔位** `done_ok`：
+> 一旦置 True 就活到进程重启，把之后**每一次**暂停（锁屏、空闲、下一次关机）全部短路掉，
+> 而且是**静默**短路 —— `pause()` 直接 `return None`，一个字节的日志都不写。
+> 2026-10-04 14:53 和 10-05 02:08 两次关机暂停就是这么漏掉的
+> （日志里只有「收到系统结束会话通知」，后面什么都没有）。
+
+### 「飞行中」不去重（已知取舍）
+
+删掉 `_INFLIGHT["ch"]` 占位牌之后，**同一刻正在飞行的请求之间不再互斥** ——
+闸门只在「刚发成功过」时让位，对「别人正在发」没有占位。
+
+实际影响很小：目前只有轮询线程和消息线程两条触发路径，各自串行，只有两者恰好重叠
+（轮询发请求的 ~100ms 内又收到关机通知）才会多发一次。概率约 0.0006% 量级，
+后果只是服务端多收一次幂等请求（回 `500 same pause state`），不会扣错时长。
+
+保留占位要引入第二个 TTL 和第二条释放路径，用一个复杂度换一个几乎不发生的场景，不值。
+
+### DNS 必须提前解析
+
+`getaddrinfo()` 是阻塞的系统调用、**没有取消接口**（POSIX / Windows 都没提供），
+而关机时 Windows 会先拆网络组件再通知程序，那一刻的解析可能长时间不返回 ——
+实测把解析卡住 8 秒，一个设了 2 秒超时的请求真跑了 8.17 秒。
+系统判「未响应」只有 5 秒，拖过去会弹「此应用阻止关机」。
+
+做法是**提前把地址解析好缓存起来**（`transport.prewarm()`），之后命中缓存就完全不走解析：
+
+```
+prewarm()  启动时解析一次 → _DNS_CACHE
+     ↓
+call()     命中缓存 → 直接用，不碰 getaddrinfo
+```
+
+开机自启时网络往往还没就绪，`prewarm()` 第一次**必然失败**，此时会打一条警告日志，
+由轮询线程定期重试（`dns_ready()` 为假就补一次 `prewarm()`）。
+
+> 曾经用过「子线程 + `join(timeout)`」模拟 DNS 超时，但 `getaddrinfo` 不可取消 ——
+> 超时只能让主线程不再等待，工作线程仍在系统调用里挂着，属于**线程泄漏**。
+> 且那个机制的唯一退路（「落盘欠账 + 开机补发」）后来被删了，快速失败之后没人来补，
+> 于是改成「预热 + 补预热」：让失败压根别发生，比失败后补救更实在。
+
+---
+
+## 十、其它风险
 
 - `resolution_mode` 保持 `phone.1`（模拟器那边的事，与本文无关，一并提醒）。
 - 多设备登录可能顶号。服务端状态是账号级的，本方案不涉及并发登录，风险低。

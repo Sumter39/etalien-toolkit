@@ -95,10 +95,10 @@
 
 | 场景 | 感知方式 | 实测响应 |
 | --- | --- | --- |
-| 关机 / 重启 / 注销 | `WM_QUERYENDSESSION` | 117 ms |
+| 关机 / 重启 / 注销 | `WM_QUERYENDSESSION` | 83 ms |
 | 睡眠 / 休眠 / 合盖 | `WM_POWERBROADCAST` | 79 ms |
-| 退出客户端 | 轮询进程表 | 141 ms |
-| 锁屏 / 键鼠空闲超阈值 | `LogonUI.exe` + `GetLastInputInfo` | 126 ms |
+| 退出客户端 | 轮询进程表 | 95 ms |
+| 锁屏 / 键鼠空闲超阈值 | `LogonUI.exe` + `GetLastInputInfo` | 84 ms |
 
 关机只给 5 秒窗口，上面这些响应时间够用。守护进程不需要管理员权限，
 它只发一个 HTTPS 请求，不碰客户端进程。
@@ -185,7 +185,7 @@ etalien-toolkit/
 │   │   ├── procs.py           # 子进程封装（隐藏控制台窗口）
 │   │   ├── api/               # 接口层：proto / creds / transport / endpoints
 │   │   ├── adwatch/           # 模拟器端：emulator / adb / ui / progress / runner
-│   │   └── timeguard/         # PC 端守护：window / poller / pauser / service
+│   │   └── timeguard/         # PC 端守护：window / poller / pauser / service / state
 │   ├── scripts/               # 两个入口
 │   │   ├── adwatch.py         # 模拟器端签到
 │   │   └── guard.py           # PC 端守护进程
@@ -226,10 +226,17 @@ python -m unittest discover -s src/test -t src -v
 该 token 的那一端摇醒，让它按自己的规则刷新，再把新凭据读回来
 （模拟器端是冷启动 App，见 `etalien.api.read_progress(auto_renew=True)`）。
 
+**PC 客户端不续期，过期只能重新登录。** 实测：把 `etalien.exe` 杀干净再冷启动
+（不重新登录），内存里抓到的 token 与之前**完全一致**；而在 `app.so` 的全量 `/v2/...`
+路径表里也**没有** `refresh/token`。所以 PC 那份只能靠人重新登录来换新。
+安卓 App 则带续租逻辑（`ETMyUserProfileManager.N()`）：距上次续租超过 24 小时才调一次
+`refresh/token`，且只在 `MainActivity` 初始化时检查，也就是**冷启动才触发** —— 一直开着
+不关并不会续。这是补凭据「先 PC 后 App」顺序的依据：PC 端要靠人，App 端自己会续。
+
 两端凭据统一存 `output/cred.json`，**连来源端一起存**（`os` / `ver`）—— 光有 token 不知道该配
 哪组 `x-eta`。取用时**挑保存时间最新的那份**（`cred_rank()`）—— 谁最后被刷新过，谁最可能还有效：
 `pc-client` 由 `etapi.py scan` 刷新，`android-app` 每跑一次 adwatch 都**复写**一遍
-（`saved` / `ts` 就是「谁最新」的依据，所以每次都刷新时间戳；App 自己带续期逻辑，活得久些）。
+（`saved` / `ts` 就是「谁最新」的依据，所以每次都刷新时间戳）。
 两份 token 的权限是**账号级**的、不分端：实测拿 App 那份
 去调 PC 端的只读接口和暂停写接口都能过（写接口回 `500 can not update same`，不是 401），
 `os`/`ver` 只是客户端标识，服务端不拿它卡鉴权 —— 所以借 App 的手续来的 token，PC 端照样能用。
@@ -241,10 +248,10 @@ python -m unittest discover -s src/test -t src -v
 `pause()` 撞上 401 会**就地换一份重试**，不等半小时的周期复检；两份都不行才以 `token-expired`
 落进状态文件。判定失效**只认 401**：探活返回「没网 / 超时 / 5xx」算「判断不了」，不报警也不去续期。
 关机 / 注销 / 睡眠走 `fast` 路径，只发一次、不换凭据，把请求压在系统等待阈值以内。
-PC 客户端不提供自动续期，token 过期后需要重新登录；模拟器端 App 自带续期逻辑，所以补凭据走 App。
 
-实测寿命约 23 小时（10-01 01:24:35 签发 → 10-02 00:15 失效），跨过一次客户端重启。
 失效表现是 `HTTP 401` + `token expired` / `invalid auth token`。
+寿命由服务端定，实测两次：PC 那份 60 小时后失效，App 那份 15 小时后仍可用。
+客户端手里只有「过期了没有」这个布尔值、没有「什么时候过期」，所以撞上 401 才知道。
 
 **自启写注册表 Run 键**（`HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Run`）。零权限、
 不经过 shell、链路最短，登录即触发，任务管理器「启动」标签里能看到、能禁用。
@@ -252,10 +259,15 @@ PC 客户端不提供自动续期，token 过期后需要重新登录；模拟�
 会为子进程建一个随转发器退出的作业对象，关机时转发器先被结束，子进程会被连带杀掉，
 日志一个字节都写不出。
 
-**关机路径的三层兜底。** 关机回调只给几秒，请求可能来不及发出，而服务端照扣时长。所以：
-① 发请求前先把这次暂停记进 `output/pending_pause.json`，发成功才删；
-② 开机时读这个文件补发；
-③ 轮询里按 5 秒起、每次翻倍的间隔重试，最长 5 分钟，没成功就不算完成。
+**暂停闸门带失效时间。** 消息循环（关机/睡眠）和轮询线程（客户端退出/锁屏/空闲）都可能
+在同一刻喊暂停，靠一道闸门去重：发成功后在 3 秒内不再重复发。这个窗口只用来吸收
+`WM_QUERYENDSESSION` 和紧随其后的 `WM_ENDSESSION` 这对重复通知，**过期自动失效** ——
+没有时效的话，一次成功会把之后所有暂停全短路掉，线上正是这么漏过两次关机暂停的。
+
+**DNS 必须提前解析好。** `getaddrinfo()` 是阻塞的系统调用、没有取消接口，而关机时
+Windows 会先拆网络组件再通知程序，那一刻的解析可能长时间不返回（系统判「未响应」
+只有 5 秒）。所以守护进程启动时就把地址解析好存进缓存（`prewarm()`），之后命中缓存
+就完全不走解析；开机自启时网络常常还没就绪、第一次必然失败，由轮询线程定期补。
 
 ## 已知限制
 
