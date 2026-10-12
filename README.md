@@ -124,15 +124,17 @@
 4. PC 端装好外星仔客户端并登录
 
 ```bash
-pip install -r requirements.txt
-cp config.example.json config.json      # Git Bash
-copy config.example.json config.json    # CMD
+python -m venv .venv                     # 虚拟环境直接建在项目里
+.venv/Scripts/python.exe -m pip install -r requirements.txt
+cp config.example.json config.json       # Git Bash
+copy config.example.json config.json     # CMD
 ```
 
 然后填 `config.json`：`mumu_manager`（`MuMuManager.exe` 的完整路径）、`adb_path`、
 `mumu_vmindex`（实例编号，多开器里能看到，通常 `0`）、`serial`（MuMu 新版是
 `127.0.0.1:16384`，老版是 `127.0.0.1:7555`）、`oaid`（任意 UUID）、`venv`
-（Python 虚拟环境根目录，`guard` 要靠它挂 `pywin32`）。
+（虚拟环境根目录的绝对路径，推荐就填项目里的 `.venv`；`guard` 要靠它挂 `pywin32`）。
+把 venv 放进项目是为了不依赖外部工具链的安装目录 —— 它自动更新时可能把解释器换掉。
 
 `config.json` 已被 `.gitignore` 忽略。必填项没填会直接报错并指出缺哪一项。
 
