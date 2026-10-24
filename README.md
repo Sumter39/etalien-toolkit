@@ -55,6 +55,24 @@
 （多开器）是常驻组件，所以两步都要做。主程序被关掉后，下次运行会自动以管理员身份重新
 拉起（`MuMuManager` 靠主程序的 IPC 启动实例）。调试时想留着模拟器，加 `--keep-emulator`。
 
+### 弹更新窗时先更新，不关模拟器
+
+App 检测到新版本会在启动后弹「发现新版本 vX.Y.Z」。这层压在最上面，下面的入口全都点不到；
+按原来的流程会判定失败、收工关模拟器 —— 而下载／安装一断就得从头再来（重下 44 MB），
+下次启动又是一张新弹窗，永远走不完。
+
+所以启动后的第一件事就是把它做掉：点「立即更新」→ 等 App 把 APK 写进自己的
+`files/<版本>.apk` → 拷到 `/data/local/tmp` → 设备端 `pm install -r` → `am start` 拉回主界面。
+
+| 环节 | 判据 / 做法 |
+| --- | --- |
+| 算不算下完 | 两次采样体积一致且 ≥ 10 MB。App 直接写最终文件名，光看文件出现会把半截包送去装 |
+| 怎么装 | `pm install -r` 保数据，登录态与可暂停时长都不掉；不走界面安装器，省掉「未知来源」授权与确认框 |
+| 没做成 | 保留模拟器、本轮直接收工，下次启动接着来（关掉就前功尽弃） |
+
+装完 App 版本号会变，但 `x-eta` 的 `ver` 本来就每次现读 `dumpsys`，凭据不用手工改。
+只想把弹窗收掉、不安装，加 `--no-update`。
+
 ### 额度
 
 | 档位 | 次数 | 单次收益 |
@@ -141,10 +159,11 @@ copy config.example.json config.json     # CMD
 ### 模拟器端
 
 ```bash
-python src/scripts/adwatch.py --dry-run   # 先只探测界面，确认能找到入口
-python src/scripts/adwatch.py             # 正式跑，刷满今天额度
-python src/scripts/adwatch.py --state     # 看今天跑到哪、刷完没（不连模拟器）
-python src/scripts/adwatch.py --install   # 装开机自启
+python src/scripts/adwatch.py --dry-run      # 先只探测界面，确认能找到入口
+python src/scripts/adwatch.py                # 正式跑，刷满今天额度
+python src/scripts/adwatch.py --state        # 看今天跑到哪、刷完没（不连模拟器）
+python src/scripts/adwatch.py --install      # 装开机自启
+python src/scripts/adwatch.py --no-update    # 遇到「发现新版本」只收掉、不安装
 ```
 
 同一天重复触发是安全的：刷满了秒退，没刷满就接着补。
@@ -186,7 +205,7 @@ etalien-toolkit/
 │   │   ├── logs.py            # 日志
 │   │   ├── procs.py           # 子进程封装（隐藏控制台窗口）
 │   │   ├── api/               # 接口层：proto / creds / transport / endpoints
-│   │   ├── adwatch/           # 模拟器端：emulator / adb / ui / progress / runner
+│   │   ├── adwatch/           # 模拟器端：emulator / adb / ui / progress / update / runner
 │   │   └── timeguard/         # PC 端守护：window / poller / pauser / service / state
 │   ├── scripts/               # 两个入口
 │   │   ├── adwatch.py         # 模拟器端签到
