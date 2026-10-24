@@ -35,6 +35,11 @@ CONFIG = {
     # 等广告 Activity 出现的最长秒数
     "ad_appear_timeout": 40,
 
+    # 自更新：等 App 下完 APK / 设备端 pm install 的上限（秒）。安装走 pm，
+    # 不走界面安装器 —— 模拟器里没有「未知来源」授权这一层，也不弹确认框。
+    "update_download_timeout": 900,
+    "update_install_timeout": 300,
+
     # 模拟器开机 / adb 就绪的上限（调优参数，config.json 可覆盖）
     "mumu_boot_timeout": get("mumu_boot_timeout"),
 

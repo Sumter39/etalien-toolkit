@@ -12,7 +12,7 @@ import sys
 import time
 
 from .. import config as cfg
-from . import emulator, progress, state, ui
+from . import emulator, progress, state, ui, update
 from .adb import connect, ensure_ready
 from .config import CONFIG, log
 
@@ -172,6 +172,8 @@ def main():
     ap.add_argument("--rounds", type=int, default=CONFIG["max_rounds"])
     ap.add_argument("--force", action="store_true", help="无视「今天已看完」和尝试上限，强制跑")
     ap.add_argument("--keep-emulator", action="store_true", help="跑完不关模拟器")
+    ap.add_argument("--no-update", action="store_true",
+                    help="遇到「发现新版本」弹窗时只关掉、不安装")
     ap.add_argument("--delay", type=int, default=0,
                     help="启动前先等这么多秒（自启时让系统先稳定下来）")
     ap.add_argument("--state", action="store_true", help="打印每日状态后退出（不连模拟器）")
@@ -226,12 +228,24 @@ def main():
     log("启动 app…")
     d.app_start(CONFIG["package"])
     time.sleep(5)
-    ui.dismiss_popups(d)
 
     done_today = False     # 今天额度是否已全部看完 → 决定以后还要不要补跑
     snapshot = None        # 进度快照，便于知道上次停在哪
     started = False        # 是否「有效尝试」：决定要不要把今天记进状态
+    hold_emu = False       # 更新没做完时保住模拟器，别把下载/安装一起关掉
     try:
+        # 自更新放在最前面：弹窗压在最上层，不处理的话后面每一步都点不到，
+        # 流程收工会顺手关掉模拟器，这次下载就白下了。
+        if args.no_update:
+            update.skip(d, adb)
+        else:
+            res = update.handle(d, adb)
+            if res == "stuck":
+                hold_emu = True
+                log("✗ 更新没做完，本轮就此打住（模拟器保持运行，否则下载/安装全丢）")
+                return
+        ui.dismiss_popups(d)
+
         # 登录状态以接口为准（能读到进度就是已登录）。界面文案只用来补充提示 ——
         # UI 会漏渲染、也会出现同名字样，拿它当判定条件会误退。
         cur = progress.fetch(adb, cfg.serial())
@@ -308,6 +322,11 @@ def main():
     finally:
         if started:
             state.save(date=today, all_done=done_today, progress=snapshot)
-        # 退出即彻底关掉模拟器（用户明确要求）。要留着现场排查/手动登录，加 --keep-emulator。
-        if not args.keep_emulator:
+        # 退出即彻底关掉模拟器（用户明确要求）。要留着现场排查/手动登录，加 --keep-emulator；
+        # 更新没做完时也得留着 —— 关掉会把正在走的下载/安装打断，下次还得重来一遍。
+        if args.keep_emulator:
+            pass
+        elif hold_emu:
+            log("  模拟器保持运行（更新未完成，下次启动接着来）")
+        else:
             emulator.shutdown()

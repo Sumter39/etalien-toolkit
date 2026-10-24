@@ -52,6 +52,14 @@ def punch_home(d, tries=3):
 
 def dismiss_popups(d):
     """点掉挡路的弹窗。优先处理 app 的「确定要退出吗」。"""
+    # 更新弹窗不能当普通弹窗点掉：关掉它等于放弃这次更新，下载一半的包也白扔。
+    # 它由 update.handle 处理，这里原样留着。
+    try:
+        if d(textContains="发现新版本").exists:
+            return False
+    except Exception:
+        pass
+
     try:
         if d(textContains="退出").exists and d(text="取消").exists:
             d(text="取消").click()
