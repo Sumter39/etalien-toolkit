@@ -55,17 +55,23 @@ def ensure_ready(adb):
     if not emulator.started() and not emulator.start():
         raise SystemExit(1)
 
-    # 2) 等 adb 可连
+    # 2) 等 adb 可连。只认 "\tdevice" —— 模拟器刚启动时 devices 里已经有这个串号，
+    #    但状态是 offline；拿它当就绪，后面 adb root 全部落空，品牌属性刷不进去。
     log("等待模拟器 adb 就绪…")
     t0 = time.time()
     while time.time() - t0 < CONFIG["mumu_boot_timeout"]:
+        out = run([adb, "devices"], capture_output=True,
+                  timeout=20).stdout.decode("utf-8", "ignore")
+        if cfg.serial() + "\toffline" in out:
+            # 上一次运行留下的连接，实例已换、它起不来，掐掉再连
+            run([adb, "disconnect", cfg.serial()], capture_output=True, timeout=20)
         run([adb, "connect", cfg.serial()], capture_output=True, timeout=20)
         out = run([adb, "devices"], capture_output=True,
                   timeout=20).stdout.decode("utf-8", "ignore")
-        if cfg.serial() in out:
+        if cfg.serial() + "\tdevice" in out:
             log("adb 已就绪（%.0fs）" % (time.time() - t0))
             break
-        time.sleep(5)
+        time.sleep(3)
     else:
         log("✗ 等不到模拟器 adb 就绪（%ds）" % CONFIG["mumu_boot_timeout"])
         raise SystemExit(1)
