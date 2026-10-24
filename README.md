@@ -1,10 +1,14 @@
-# etalien-toolkit
+<h1 align="center">ETALIEN-TOOLKIT</h1>
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Platform](https://img.shields.io/badge/Platform-Windows-0078D6.svg)]()
-[![Python](https://img.shields.io/badge/Python-3.8%2B-3776AB.svg)]()
+<p align="center">外星仔加速器（ETAlien Booster）的自动化工具</p>
 
-外星仔加速器（ETAlien Booster）的自动化工具，两个部分互不依赖，可以只用其中一个：
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"></a>
+  <img src="https://img.shields.io/badge/Platform-Windows-0078D6.svg" alt="Platform: Windows">
+  <img src="https://img.shields.io/badge/Python-3.8%2B-3776AB.svg" alt="Python: 3.8+">
+</p>
+
+两个部分互不依赖，可以只用其中一个：
 
 - **模拟器端**：在 MuMu 模拟器里自动刷满当天「看广告领时长」的额度。
 - **PC 端**：在退出客户端、关机、睡眠、长时间没操作时自动暂停计时。
